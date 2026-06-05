@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+'use strict';
+
+// Entrypoint used by the Electron main bundle when it tries to launch the
+// native ZaloCall helper on Linux.
+require('./zalo-call-mock');

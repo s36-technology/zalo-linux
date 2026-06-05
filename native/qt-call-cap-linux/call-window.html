@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZaloCall Linux</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
+      background: #111318;
+      color: #f5f7fb;
+    }
+
+    body {
+      display: grid;
+      place-items: stretch;
+    }
+
+    .call {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      min-height: 100vh;
+      background: linear-gradient(180deg, #1e242d 0%, #111318 68%);
+    }
+
+    .main {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      padding: 32px 24px 16px;
+      text-align: center;
+    }
+
+    .avatar {
+      width: 112px;
+      height: 112px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #2b7de9;
+      color: white;
+      font-size: 46px;
+      font-weight: 700;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 100%;
+      font-size: 22px;
+      line-height: 1.25;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .status {
+      margin: 0;
+      min-height: 24px;
+      color: #a9b3c2;
+      font-size: 14px;
+    }
+
+    .media {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+      min-height: 28px;
+    }
+
+    .pill {
+      min-height: 28px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #d7dce5;
+      font-size: 12px;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 22px 24px 28px;
+      background: rgba(0, 0, 0, 0.16);
+    }
+
+    button {
+      border: 0;
+      cursor: pointer;
+      font: inherit;
+    }
+
+    .hangup {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #e5484d;
+      color: white;
+      font-size: 24px;
+      box-shadow: 0 14px 28px rgba(229, 72, 77, 0.26);
+    }
+
+    .answer {
+      min-width: 104px;
+      height: 56px;
+      padding: 0 22px;
+      border-radius: 999px;
+      background: #20b26b;
+      color: white;
+      font-size: 16px;
+      font-weight: 700;
+      box-shadow: 0 14px 28px rgba(32, 178, 107, 0.24);
+    }
+
+    .answer:hover {
+      background: #179b5b;
+    }
+
+    .hangup:hover {
+      background: #d83d42;
+    }
+
+    button:disabled {
+      cursor: default;
+      opacity: 0.56;
+    }
+  </style>
+</head>
+<body>
+  <div class="call">
+    <main class="main">
+      <div class="avatar" id="avatar">Z</div>
+      <h1 id="name">ZaloCall</h1>
+      <p class="status" id="status">Connecting...</p>
+      <div class="media" id="media"></div>
+    </main>
+    <div class="controls">
+      <button class="answer" id="answer" title="Answer call" aria-label="Answer call" hidden>Answer</button>
+      <button class="hangup" id="hangup" title="End call" aria-label="End call">x</button>
+    </div>
+  </div>
+
+  <script>
+    const avatar = document.getElementById('avatar');
+    const nameEl = document.getElementById('name');
+    const statusEl = document.getElementById('status');
+    const mediaEl = document.getElementById('media');
+    const answer = document.getElementById('answer');
+    const hangup = document.getElementById('hangup');
+    let currentCall = {};
+    let timer = null;
+    let ending = false;
+    let hangupGuardUntil = 0;
+    let hangupGuardTimer = null;
+    const ANSWER_HANGUP_GUARD_MS = 5000;
+    const ringback = {
+      active: false,
+      context: null,
+      interval: null,
+      timers: [],
+      oscillators: []
+    };
+
+    function render(call) {
+      currentCall = call || {};
+      ending = false;
+      const displayName = currentCall.calleeName || currentCall.calleeId || 'ZaloCall';
+      nameEl.textContent = displayName;
+      avatar.textContent = String(displayName).trim().charAt(0).toUpperCase() || 'Z';
+
+      mediaEl.innerHTML = '';
+      addPill(currentCall.isVideo ? 'Video call' : 'Audio call');
+      if (currentCall.incoming && !currentCall.answeredAt) addPill('Incoming');
+      if (currentCall.ringing) addPill('Ringing');
+      if (currentCall.media && currentCall.media.sendOnly) addPill('Mic sending');
+      if (currentCall.media && currentCall.media.receive) addPill('Speaker receiving');
+      if (currentCall.media && currentCall.media.remoteRtpAddress) addPill(currentCall.media.remoteRtpAddress);
+
+      answer.hidden = !(currentCall.incoming && !currentCall.answeredAt);
+      answer.disabled = false;
+      syncHangupGuard();
+      syncRingback();
+      updateDuration();
+      syncDurationTimer();
+    }
+
+    function addPill(text) {
+      const pill = document.createElement('span');
+      pill.className = 'pill';
+      pill.textContent = text;
+      mediaEl.appendChild(pill);
+    }
+
+    function updateDuration() {
+      if (ending) return;
+
+      const baseTime = currentCall.answeredAt || currentCall.startedAt || Date.now();
+      const elapsed = Math.max(0, Math.floor((Date.now() - baseTime) / 1000));
+      const minutes = String(Math.floor(elapsed / 60)).padStart(2, '0');
+      const seconds = String(elapsed % 60).padStart(2, '0');
+      if (currentCall.answeredAt) {
+        statusEl.textContent = `In call ${minutes}:${seconds}`;
+        return;
+      }
+
+      statusEl.textContent = currentCall.incoming ? 'Incoming call' : 'Calling...';
+    }
+
+    function syncDurationTimer() {
+      if (currentCall.answeredAt && !timer) {
+        timer = setInterval(updateDuration, 1000);
+        return;
+      }
+
+      if (!currentCall.answeredAt && timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    }
+
+    function syncRingback() {
+      if (currentCall.ringing && !currentCall.answeredAt && !ending) {
+        startRingback();
+      } else {
+        stopRingback();
+      }
+    }
+
+    function startRingback() {
+      if (ringback.active) return;
+
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+
+      ringback.active = true;
+      ringback.context = ringback.context || new AudioContext();
+      ringback.context.resume().catch(() => {});
+      playRingbackBurst();
+      ringback.interval = setInterval(playRingbackBurst, 3600);
+    }
+
+    function playRingbackBurst() {
+      if (!ringback.active || !ringback.context) return;
+
+      const context = ringback.context;
+      const start = context.currentTime;
+      const gain = context.createGain();
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.08, start + 0.03);
+      gain.gain.setValueAtTime(0.08, start + 1.15);
+      gain.gain.linearRampToValueAtTime(0, start + 1.25);
+      gain.connect(context.destination);
+
+      const first = createRingbackOscillator(context, 440);
+      const second = createRingbackOscillator(context, 480);
+      first.connect(gain);
+      second.connect(gain);
+      ringback.oscillators.push(first, second);
+      first.start(start);
+      second.start(start);
+      first.stop(start + 1.28);
+      second.stop(start + 1.28);
+
+      const timerId = setTimeout(() => {
+        stopOscillator(first);
+        stopOscillator(second);
+        try {
+          gain.disconnect();
+        } catch (_) {}
+      }, 1400);
+      ringback.timers.push(timerId);
+    }
+
+    function createRingbackOscillator(context, frequency) {
+      const oscillator = context.createOscillator();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(frequency, context.currentTime);
+      return oscillator;
+    }
+
+    function stopRingback() {
+      ringback.active = false;
+      if (ringback.interval) {
+        clearInterval(ringback.interval);
+        ringback.interval = null;
+      }
+
+      for (const timerId of ringback.timers.splice(0)) {
+        clearTimeout(timerId);
+      }
+
+      for (const oscillator of ringback.oscillators.splice(0)) {
+        stopOscillator(oscillator);
+      }
+    }
+
+    function stopOscillator(oscillator) {
+      try {
+        oscillator.stop();
+      } catch (_) {}
+      try {
+        oscillator.disconnect();
+      } catch (_) {}
+    }
+
+    function isHangupGuarded() {
+      return Date.now() < hangupGuardUntil;
+    }
+
+    function syncHangupGuard() {
+      hangup.disabled = isHangupGuarded();
+
+      if (hangupGuardTimer) {
+        clearTimeout(hangupGuardTimer);
+        hangupGuardTimer = null;
+      }
+
+      if (hangup.disabled) {
+        hangupGuardTimer = setTimeout(syncHangupGuard, Math.max(0, hangupGuardUntil - Date.now()));
+      }
+    }
+
+    function guardHangupAfterAnswer() {
+      hangupGuardUntil = Date.now() + ANSWER_HANGUP_GUARD_MS;
+      syncHangupGuard();
+    }
+
+    answer.addEventListener('click', () => {
+      answer.disabled = true;
+      guardHangupAfterAnswer();
+      statusEl.textContent = 'Connecting...';
+      window.zaloCallWindow.answer();
+    });
+
+    hangup.addEventListener('click', () => {
+      if (isHangupGuarded()) {
+        syncHangupGuard();
+        return;
+      }
+
+      ending = true;
+      stopRingback();
+      window.zaloCallWindow.hangup();
+      hangup.disabled = true;
+      statusEl.textContent = 'Ending...';
+    });
+
+    window.addEventListener('beforeunload', stopRingback);
+    window.zaloCallWindow.onUpdate(render);
+    window.zaloCallWindow.getCallInfo().then(render);
+    window.zaloCallWindow.ready();
+  </script>
+</body>
+</html>
