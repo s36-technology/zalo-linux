@@ -1,6 +1,7 @@
 dist
 node_modules
 .claw
+.idea
 .clawd-todos.json
 unnamed_addrs.txt
 strings.txt
