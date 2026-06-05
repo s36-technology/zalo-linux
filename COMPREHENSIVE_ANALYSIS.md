@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This is an **unofficial port of the Zalo macOS desktop client to Linux**, created by extracting the `.asar` archive from the macOS `.dmg`, then running it with Electron v22.3.27. It is NOT a web wrapper — it runs the actual Zalo macOS Electron app code. The project is maintained at `github.com/realdtn2/zalo-linux-2026`.
+This is an **unofficial port of the Zalo macOS desktop client to Linux**, created by extracting the `.asar` archive from the macOS `.dmg`, then running it with Electron v22.3.27. It is NOT a web wrapper — it runs the actual Zalo macOS Electron app code. The project is maintained at `github.com/s36-technology/zalo-linux`.
 
 **Current version:** v1.1.1 (project) / Zalo 26.3.20 (app version)
 **Electron version:** v22.3.27 (CRITICAL — newer versions cause errors)

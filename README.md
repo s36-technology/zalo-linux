@@ -1,4 +1,4 @@
-# Zalo Linux Port 2026
+# Zalo Linux
 ⚠️ **Work in Progress** - This project is under active development.
 A Linux port of Zalo, bringing the popular Vietnamese messaging application to the Linux platform.
 
@@ -18,7 +18,7 @@ The port was created by:
 
 ## Installation
 
-Download the latest Linux package from the [Releases](https://github.com/realdtn2/zalo-linux-2026/releases/latest) page.
+Download the latest Linux package from the [Releases](https://github.com/s36-technology/zalo-linux/releases/latest) page.
 
 ### AppImage
 ```bash
@@ -208,4 +208,4 @@ This is an active work-in-progress project. Contributions are welcome! Please:
 
 ## Support
 
-For issues, questions, or suggestions, please open an issue on the [GitHub Issues](https://github.com/realdtn2/zalo-linux-2026/issues) page.
+For issues, questions, or suggestions, please open an issue on the [GitHub Issues](https://github.com/s36-technology/zalo-linux/issues) page.
