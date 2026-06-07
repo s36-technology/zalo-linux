@@ -2297,10 +2297,16 @@ class LinuxMediaEngine {
             return process.env.ZALO_LINUX_CALL_ZRTC_SHORT_MEDIA !== '0';
         }
 
-        // Some call answers advertise packetMode=2, but remote clients still
-        // expect the token-prefixed media frame for uplink audio. Keep the
-        // proven long packet as the Linux default; env can re-enable short mode.
-        return false;
+        // packetMode=2 is the short ZRTC media lane: type=4 followed by RTP.
+        // Outgoing calls were connected but silent when Linux ignored this and
+        // kept sending the token-prefixed type=3 frame. Keep incoming calls on
+        // the older long frame because that path is already known to work.
+        return !!(
+            relay &&
+            relay.call &&
+            !relay.call.incoming &&
+            Number(relay.zrtcPacketMode) === 2
+        );
     }
 
     getZrtcPacketMode(call) {
