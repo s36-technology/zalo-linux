@@ -7,7 +7,7 @@ module.exports = {
     winUtils: load('./win-utils/index.js'),
     zcall: load('./zcall/index.js'),
     sqlite3: load('./sqlite3/index.js'),
-    dbUtils: load('./db-cross-v4/dist/binding.js'),
+    dbUtils: load('./db-cross-v4/binding.js'),
     v8Profiles: load('./v8-profiles/index.js'),
     zimage: (options) => require('./zimage/index.js')(options),
     zaloLogger: load('./logger/index.js'),

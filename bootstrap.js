@@ -48,6 +48,57 @@ function configureLinuxGpuFallback() {
     app.commandLine.appendSwitch('disable-gpu');
 }
 
+function sanitizeLogMetaFiles() {
+    const userData = app.getPath('userData');
+    const calDir = path.join(userData, 'cal');
+
+    try {
+        if (!fs.existsSync(calDir)) {
+            return;
+        }
+
+        for (const entry of fs.readdirSync(calDir)) {
+            if (!entry.endsWith('.meta')) {
+                continue;
+            }
+
+            sanitizeLogMetaFile(path.join(calDir, entry));
+        }
+    } catch (_) {}
+}
+
+function sanitizeLogMetaFile(metaPath) {
+    let raw = '';
+
+    try {
+        raw = fs.readFileSync(metaPath, 'utf8');
+        const parsed = JSON.parse(raw);
+
+        if (parsed && typeof parsed === 'object') {
+            return;
+        }
+    } catch (_) {}
+
+    const backupPath = `${metaPath}.bad-${Date.now()}`;
+
+    try {
+        if (fs.existsSync(metaPath)) {
+            fs.renameSync(metaPath, backupPath);
+        }
+
+        fs.writeFileSync(metaPath, JSON.stringify({
+            current: 0,
+            ss: -1,
+            ss_ln: -1,
+            startups: []
+        }));
+    } catch (_) {
+        try {
+            fs.writeFileSync(metaPath, raw || '{}');
+        } catch (_) {}
+    }
+}
+
 function shouldEnableLinuxCallSupport() {
     return process.platform === 'linux' &&
         (process.env.ZALO_ENABLE_LINUX_CALL === '1' ||
@@ -387,6 +438,7 @@ function runWithSingleInstanceLock(startApp) {
 function bootstrap() {
     patchDeprecatedRecursiveRmdir();
     configureLinuxGpuFallback();
+    sanitizeLogMetaFiles();
     patchBrowserWindowForLinuxRuntime();
     traceLinuxCallIpc();
     redirectLinuxCallSpawn();
