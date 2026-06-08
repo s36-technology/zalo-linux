@@ -905,6 +905,7 @@ class LinuxMediaEngine {
             zrtcDroppedLocalBytes: 0,
             zrtcPlainFallbackPackets: 0,
             zrtcDualLocalPackets: 0,
+            zrtcDualWrapperPackets: 0,
             zrtcRemoteAudioPackets: 0,
             zrtcRemoteVideoPackets: 0,
             zrtcRemoteVideoInvalidPackets: 0,
@@ -1052,6 +1053,21 @@ class LinuxMediaEngine {
         const packet = this.buildZrtcMediaPacket(relay, message, token || 0, false);
         relay.zrtcWrappedLocalPackets += 1;
         relay.zrtcWrappedLocalBytes += packet.length;
+
+        if (this.shouldDualSendZrtcWrappers(relay, token || 0)) {
+            const fallbackPacket = this.buildZrtcMediaPacket(relay, message, token || 0, false, {
+                forceLong: true
+            });
+
+            if (!fallbackPacket.equals(packet)) {
+                relay.zrtcDualWrapperPackets += 1;
+                this.noteZrtcDualWrapperSend(relay, message.length);
+                return [
+                    packet,
+                    fallbackPacket
+                ];
+            }
+        }
 
         if (this.shouldDualSendPlainMedia(relay)) {
             relay.zrtcDualLocalPackets += 1;
@@ -2207,6 +2223,43 @@ class LinuxMediaEngine {
         }));
     }
 
+    shouldDualSendZrtcWrappers(relay, token) {
+        if (!relay || !relay.zrtcMediaEnabled || !token) {
+            return false;
+        }
+
+        if (process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER === '0') {
+            return false;
+        }
+
+        if (!relay.call || relay.call.incoming || Number(relay.zrtcPacketMode) !== 2) {
+            return false;
+        }
+
+        // Some Zalo peers answer packetMode=2 but never emit downlink media
+        // when the caller only sends the short type=4 wrapper. Send both early
+        // wrapper shapes until remote audio appears, then converge immediately.
+        if (relay.zrtcRemoteAudioPackets > 0) {
+            return false;
+        }
+
+        const maxPackets = Math.max(0, Number(process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER_PACKETS || 300));
+        return relay.localPackets <= maxPackets;
+    }
+
+    noteZrtcDualWrapperSend(relay, bytes) {
+        if (
+            relay.zrtcDualWrapperPackets !== 1 &&
+            relay.zrtcDualWrapperPackets % 250 !== 0
+        ) {
+            return;
+        }
+
+        this.record('mediaZrtcDualWrapperSend', Object.assign(this.getRelaySummary(relay), {
+            bytes
+        }));
+    }
+
     getZrtcInitResponseToken(message) {
         if (!message || message.length < 21 || message[0] !== 2) {
             return 0;
@@ -2277,8 +2330,8 @@ class LinuxMediaEngine {
         }));
     }
 
-    buildZrtcMediaPacket(relay, payload, token, isRtcp) {
-        if (!isRtcp && this.shouldUseShortZrtcMediaPacket(relay)) {
+    buildZrtcMediaPacket(relay, payload, token, isRtcp, options = {}) {
+        if (!isRtcp && !options.forceLong && this.shouldUseShortZrtcMediaPacket(relay)) {
             const packet = Buffer.alloc(payload.length + 1);
             packet[0] = 4;
             payload.copy(packet, 1);
@@ -2457,6 +2510,7 @@ class LinuxMediaEngine {
             zrtcDroppedLocalPackets: relay.zrtcDroppedLocalPackets || undefined,
             zrtcPlainFallbackPackets: relay.zrtcPlainFallbackPackets || undefined,
             zrtcDualLocalPackets: relay.zrtcDualLocalPackets || undefined,
+            zrtcDualWrapperPackets: relay.zrtcDualWrapperPackets || undefined,
             zrtcRemoteAudioPackets: relay.zrtcRemoteAudioPackets || undefined,
             zrtcRemoteVideoPackets: relay.zrtcRemoteVideoPackets || undefined,
             zrtcRemoteVideoInvalidPackets: relay.zrtcRemoteVideoInvalidPackets || undefined,
@@ -2648,7 +2702,29 @@ class LinuxMediaEngine {
 
         const safeBase = Math.max(1024, Math.min(65534, Number(base) || 50000));
         const maxOffset = Math.max(1, Math.min(10000, 65535 - safeBase));
+        for (let attempt = 0; attempt < 64; attempt += 1) {
+            const port = safeBase + crypto.randomInt(maxOffset);
+            if (this.isUdpPortAvailable(port)) {
+                return port;
+            }
+        }
+
         return safeBase + crypto.randomInt(maxOffset);
+    }
+
+    isUdpPortAvailable(port) {
+        // GStreamer fails hard if udpsrc picks a port already owned by another
+        // process. `ss` is cheap and available on normal Linux desktops.
+        const result = spawnSync('ss', ['-H', '-lun', `sport = :${port}`], {
+            encoding: 'utf8',
+            timeout: 500
+        });
+
+        if (result.status !== 0) {
+            return true;
+        }
+
+        return !String(result.stdout || '').trim();
     }
 
     getFirstValue(...values) {
