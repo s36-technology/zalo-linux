@@ -23,7 +23,8 @@
     "build": "electron-builder --linux AppImage deb snap --publish never",
     "build:appimage": "electron-builder --linux AppImage --publish never",
     "build:deb": "electron-builder --linux deb --publish never",
-    "build:snap": "electron-builder --linux snap --publish never"
+    "build:snap": "electron-builder --linux snap --publish never",
+    "dist": "electron-builder --publish always"
   },
   "main": "bootstrap.js",
   "keywords": [
@@ -183,8 +184,6 @@
     ],
     "linux": {
       "target": [
-        "AppImage",
-        "deb",
         "snap"
       ],
       "category": "Network",
