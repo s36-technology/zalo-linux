@@ -9,6 +9,18 @@ const DEFAULT_AUDIO_CODEC = [
     { frmPtime: 20, payload: 112, name: 'opus/16000/1', dynamicFptime: 0 },
     { frmPtime: 20, payload: 113, name: 'opus/48000/2', dynamicFptime: 0 }
 ];
+const NATIVE_EVENT_TYPES = new Set([
+    'onCallAudioState',
+    'onCallAutoHangup',
+    'onCallChangeZRTP',
+    'onCallQualityChanged',
+    'onCallState',
+    'onCallVideoState',
+    'onIncomingCall',
+    'onInitZrtpRequestFailed',
+    'onInitZrtpWithServer',
+    'onMakeCall'
+]);
 
 function isLinuxCallEnabled() {
     return process.platform === 'linux' &&
@@ -36,6 +48,7 @@ class LinuxZCallBinding {
     constructor() {
         this.callback = null;
         this.eventQueue = [];
+        this.protocolQueue = [];
         this.config = {};
         this.settings = {};
         this.mediaConfig = {};
@@ -49,7 +62,8 @@ class LinuxZCallBinding {
         // then delegates signaling/window/media state to qt-call-cap-linux.
         this.engine = new LinuxCallEngine({
             log: this.log.bind(this),
-            send: this.enqueueEvent.bind(this)
+            send: this.enqueueEngineEvent.bind(this),
+            nativeEvents: true
         });
     }
 
@@ -80,9 +94,34 @@ class LinuxZCallBinding {
         }
     }
 
+    enqueueEngineEvent(message) {
+        this.enqueueProtocolEvent(message);
+        this.enqueueNativeEvents();
+    }
+
+    enqueueProtocolEvent(message) {
+        if (message) {
+            this.protocolQueue.push(message);
+        }
+    }
+
     enqueueResponses(responses) {
         for (const response of responses || []) {
-            this.enqueueEvent(response);
+            this.enqueueProtocolEvent(response);
+        }
+
+        this.enqueueNativeEvents();
+    }
+
+    enqueueNativeEvents() {
+        if (!this.engine || typeof this.engine.drainNativeEvents !== 'function') {
+            return;
+        }
+
+        for (const event of this.engine.drainNativeEvents()) {
+            if (NATIVE_EVENT_TYPES.has(event && event.type)) {
+                this.enqueueEvent(event);
+            }
         }
     }
 
@@ -154,6 +193,8 @@ class LinuxZCallBinding {
             rtcpAddress,
             rtpAddress
         });
+        this.engine.setConfiguredTransport(this.config);
+        this.enqueueNativeEvents();
     }
 
     setListServers(serversJson) {
@@ -171,6 +212,8 @@ class LinuxZCallBinding {
             audioConfig,
             extendData
         });
+        this.engine.setMediaConfig(audioConfig, extendData);
+        this.enqueueNativeEvents();
     }
 
     setState(session, peerId, zrtcConfig) {
@@ -183,11 +226,13 @@ class LinuxZCallBinding {
 
     updateCallerInfo(audioConfig, extendData) {
         this.setMediaConfig(audioConfig, extendData);
+        this.engine.updateCallerInfo(audioConfig, extendData);
+        this.enqueueNativeEvents();
     }
 
     makeCall() {
         if (!this.check()) {
-            this.enqueueEvent(this.buildPopup('ZaloCall Linux', 'Linux call mode is not enabled.'));
+            this.enqueueProtocolEvent(this.buildPopup('ZaloCall Linux', 'Linux call mode is not enabled.'));
             return;
         }
 
@@ -196,11 +241,23 @@ class LinuxZCallBinding {
 
     incomingCall() {
         if (!this.check()) {
-            this.enqueueEvent(this.buildPopup('ZaloCall Linux', 'Linux call mode is not enabled.'));
+            this.enqueueProtocolEvent(this.buildPopup('ZaloCall Linux', 'Linux call mode is not enabled.'));
             return;
         }
 
         this.enqueueResponses(this.engine.handleControl(this.buildIncomingControl()));
+    }
+
+    answerIncomingCall() {
+        this.enqueueResponses(this.engine.handleAnswerIncomingCall());
+    }
+
+    answerCall() {
+        this.answerIncomingCall();
+    }
+
+    acceptCall() {
+        this.answerIncomingCall();
     }
 
     stop() {
@@ -229,23 +286,24 @@ class LinuxZCallBinding {
     }
 
     getCallInfo() {
-        return this.engine.currentCall || {};
+        return JSON.stringify(this.engine.getCallInfo());
     }
 
-    getJsonStats406() {
-        return JSON.stringify({
-            platform: 'linux',
-            call: this.engine.currentCall || null,
-            media: this.engine.currentMediaState || null
-        });
+    getJsonStats406(startNetworkType = 0, endNetworkType = 0) {
+        return JSON.stringify(this.engine.getJsonStats406(startNetworkType, endNetworkType));
     }
 
     getListDevices() {
-        return JSON.stringify(this.engine.getDeviceList());
+        return JSON.stringify(this.engine.getNativeDeviceList());
     }
 
     getEventMessage() {
         const event = this.eventQueue.shift();
+        return event ? JSON.stringify(event) : null;
+    }
+
+    getProtocolMessage() {
+        const event = this.protocolQueue.shift();
         return event ? JSON.stringify(event) : null;
     }
 
@@ -258,40 +316,60 @@ class LinuxZCallBinding {
     }
 
     changeAudioDevice(inputId, outputId) {
-        this.localState.defaultAudInputDevice = inputId;
-        this.localState.defaultAudOutputDevice = outputId;
+        this.engine.changeAudioDevice(inputId, outputId);
+        this.enqueueNativeEvents();
     }
 
     setAudioVolume(input, output) {
-        this.localState.audioInputVolume = input;
-        this.localState.audioOutputVolume = output;
-        return true;
+        const result = this.engine.setAudioVolume(input, output);
+        this.enqueueNativeEvents();
+        return result;
     }
 
     changeVideoDevice(id) {
-        this.localState.defaultVidDevice = id;
+        this.engine.changeVideoDevice(id);
+        this.enqueueNativeEvents();
     }
 
     setAgc(auto) {
-        this.localState.autoGainControl = !!auto;
+        this.engine.setAgc(!!auto);
+        this.enqueueNativeEvents();
     }
 
     startDesktopCapture() {
-        this.localState.desktopCapture = true;
+        this.engine.startDesktopCapture();
+        if (this.engine.currentCall && !this.engine.isVideoCall(this.engine.currentCall)) {
+            this.enqueueResponses(this.engine.upgradeToVideoCall(this.config));
+            return;
+        }
+        this.enqueueNativeEvents();
     }
 
     stopDesktopCapture() {
-        this.localState.desktopCapture = false;
+        this.engine.stopDesktopCapture();
+        this.enqueueNativeEvents();
     }
 
-    changeMinMaxMobileBitrate() {}
+    upgradeToVideoCall(options = {}) {
+        this.enqueueResponses(this.engine.upgradeToVideoCall(Object.assign({}, this.config, options || {})));
+    }
+
+    switchToVideoCall(options = {}) {
+        this.upgradeToVideoCall(options);
+    }
+
+    changeMinMaxMobileBitrate(minBitrate, maxBitrate) {
+        this.engine.changeMinMaxMobileBitrate(minBitrate, maxBitrate);
+        this.enqueueNativeEvents();
+    }
 
     getExtendData() {
-        return JSON.stringify(this.config.extendData || {});
+        const extendData = this.engine.getExtendData() || this.config.extendData || {};
+        return typeof extendData === 'string' ? extendData : JSON.stringify(extendData);
     }
 
     getActiveAudioCodecs() {
-        return DEFAULT_AUDIO_CODEC;
+        return safeJsonParse(this.engine.getAudioCodec(), DEFAULT_AUDIO_CODEC);
     }
 
     bindGetPeerId(callback) {
@@ -317,6 +395,14 @@ class LinuxZCallBinding {
         return {
             partner: [partner],
             type: this.getCallType(config),
+            fromId: config.fromId,
+            userId: config.userId,
+            protocol: config.protocol,
+            callId: config.callId,
+            sessId: config.sessId || config.session,
+            settings: config.settings,
+            zrtc_config: config.zrtc_config,
+            changeZRTP: config.changeZRTP,
             groupInfo: config.groupInfo || null,
             isFirstCall: config.isFirstCall
         };

@@ -38,6 +38,20 @@ class VCLinux {
         this.instance.incomingCall();
     }
 
+    answerIncomingCall() {
+        if (typeof this.instance.answerIncomingCall === 'function') {
+            this.instance.answerIncomingCall();
+        }
+    }
+
+    answerCall() {
+        this.answerIncomingCall();
+    }
+
+    acceptCall() {
+        this.answerIncomingCall();
+    }
+
     startDesktopCapture() {
         this.instance.startDesktopCapture();
     }
@@ -56,6 +70,18 @@ class VCLinux {
 
     stopCapture(isStop) {
         this.instance.stopCapture(isStop);
+    }
+
+    upgradeToVideoCall(options = {}) {
+        if (typeof this.instance.upgradeToVideoCall === 'function') {
+            this.instance.upgradeToVideoCall(options);
+        } else {
+            this.instance.stopCapture(false);
+        }
+    }
+
+    switchToVideoCall(options = {}) {
+        this.upgradeToVideoCall(options);
     }
 
     getOsInfo() {

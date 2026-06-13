@@ -18,16 +18,27 @@ const SIGNAL_COMMAND = Object.freeze({
     REQUEST_TRANSPORT: 416
 });
 
+const VIDEO_STATE = Object.freeze({
+    LOCAL_ON: 8,
+    LOCAL_OFF: 9,
+    REMOTE_ON: 10,
+    REMOTE_OFF: 11
+});
+
 class LinuxCallEngine {
-    constructor({ log, send }) {
+    constructor({ log, send, nativeEvents }) {
         this.log = log;
         this.send = send;
         this.callRunning = false;
         this.currentCall = null;
         this.currentMediaState = null;
+        this.nativeEventsEnabled = nativeEvents === true;
+        this.nativeEventQueue = [];
+        this.localState = {};
+        this.lastOutgoingCallId = null;
         this.connectedRemoteSilenceTimer = null;
         this.experimental = process.env.ZALO_LINUX_CALL_EXPERIMENTAL === '1';
-        this.mediaEngineEnabled = process.env.ZALO_LINUX_CALL_MEDIA_ENGINE === '1';
+        this.mediaEngineEnabled = process.env.ZALO_LINUX_CALL_MEDIA_ENGINE !== '0';
         this.protocolLogPath = process.env.ZALO_CALL_PROTOCOL_LOG ||
             path.join(os.tmpdir(), 'zalo-call-linux-protocol.jsonl');
         // Keep signaling/media/window concerns separate. This class only owns
@@ -63,11 +74,42 @@ class LinuxCallEngine {
     }
 
     getDeviceList() {
-        if (this.mediaEngineEnabled) {
-            return this.mediaEngine.getDeviceList();
+        return this.mediaEngine.getDeviceList();
+    }
+
+    getNativeDeviceList() {
+        const devices = this.getDeviceList() || {};
+        const result = [];
+
+        for (const item of devices.videoInputDevices || []) {
+            result.push(this.buildNativeDevice(0, item));
         }
 
-        return this.mediaEngine.getDeviceList();
+        for (const item of devices.audioInputDevices || []) {
+            result.push(this.buildNativeDevice(1, item));
+        }
+
+        for (const item of devices.audioOutputDevices || []) {
+            result.push(this.buildNativeDevice(2, item));
+        }
+
+        return result;
+    }
+
+    buildNativeDevice(type, item) {
+        if (item && typeof item === 'object') {
+            return {
+                t: type,
+                n: String(item.name || item.displayName || item.label || item.id || ''),
+                i: String(item.id !== undefined ? item.id : item.device || item.name || '')
+            };
+        }
+
+        return {
+            t: type,
+            n: String(item || ''),
+            i: String(item || '')
+        };
     }
 
     init(data) {
@@ -81,6 +123,7 @@ class LinuxCallEngine {
 
     makeCall(data) {
         this.record('makeCall', data);
+        this.emitNativeEvent('onMakeCall');
         this.log('linux call makeCall', {
             type: data && data.type,
             partners: data && data.partner && data.partner.length,
@@ -114,7 +157,7 @@ class LinuxCallEngine {
             ];
         }
 
-        const callId = this.createCallId();
+        const callId = this.createOutgoingCallId(data);
         const callType = data.type || 1;
         const statusFiveRedialAttempt = Number(data.__linuxStatus5RedialAttempt || 0);
 
@@ -123,10 +166,12 @@ class LinuxCallEngine {
             calleeId: partner.id,
             calleeSignalId: null,
             calleeNoisedId: partner.id,
-            localUserId: null,
+            localUserId: data.fromId || data.userId || null,
             zrtcToken: 0,
             calleeName: partner.name,
             callType,
+            protocol: data.protocol,
+            session: data.sessId || data.session,
             startedAt: Date.now(),
             answeredAt: null,
             loggedBubble: false,
@@ -134,6 +179,20 @@ class LinuxCallEngine {
             statusFiveRedialAttempt,
             state: 'requesting'
         };
+        if (this.localState.configuredTransport) {
+            this.currentCall.transportConfig = Object.assign(
+                {},
+                this.localState.configuredTransport,
+                {
+                    callId,
+                    session: this.getFirstValue(
+                        this.localState.configuredTransport.session,
+                        data.sessId,
+                        data.session
+                    )
+                }
+            );
+        }
         this.currentMediaState = null;
         this.callRunning = true;
         // Show the Linux call UI as soon as dialing starts. Waiting for the
@@ -186,6 +245,10 @@ class LinuxCallEngine {
             this.mediaEngine.stop();
             this.callWindow.close();
             this.currentCall = null;
+            this.emitNativeEvent('onCallAudioState', { state: '0' });
+            this.emitNativeEvent('onCallErr', {
+                errCode: String(data.error.code || data.error)
+            });
             return [
                 this.buildCallState('free', {
                     callId,
@@ -208,6 +271,10 @@ class LinuxCallEngine {
 
         if (command === SIGNAL_COMMAND.REQUEST_TRANSPORT) {
             this.currentCall.state = 'requestAccepted';
+            this.emitNativeCallState('connected', {
+                command,
+                stage: 'request-accepted'
+            });
 
             if (!this.mediaEngineEnabled) {
                 return this.stopUnsupportedMediaCall('linux-media-engine-missing');
@@ -358,7 +425,7 @@ class LinuxCallEngine {
         this.clearConnectedRemoteSilenceWatchdog();
         this.callRunning = false;
         this.currentMediaState = null;
-        this.mediaEngine.stop();
+        this.mediaEngine.stop({ zrtcEndCall: call });
         this.callWindow.close();
         this.currentCall = null;
 
@@ -415,6 +482,19 @@ class LinuxCallEngine {
             return this.handleIncomingRequest(data);
         }
 
+        if (data.act === 'start_capture' && this.currentCall && !this.isVideoCall(this.currentCall)) {
+            return this.upgradeToVideoCall(data.data || {});
+        }
+
+        if (this.handleLocalMediaControl(data)) {
+            return [
+                this.buildCallState(this.currentCall ? 'calling' : 'free', {
+                    callId: this.currentCall && this.currentCall.callId,
+                    reason: data.act
+                })
+            ];
+        }
+
         if (this.isRemoteHangupControl(data)) {
             return this.handleRemoteEndControl(data);
         }
@@ -452,6 +532,10 @@ class LinuxCallEngine {
             const answerAckSignal = this.buildAnswerAckSignal(this.currentCall);
             this.currentCall.state = 'remoteAnswer';
             this.currentCall.answeredAt = Date.now();
+            this.emitNativeCallState('connected', {
+                callId: this.currentCall.callId,
+                stage: 'remote-answer'
+            });
             const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
 
             if (!this.mediaEngineEnabled) {
@@ -501,6 +585,11 @@ class LinuxCallEngine {
         call.state = 'remoteAnswerStatus5';
         call.statusFiveNoMedia = true;
         call.answeredAt = call.answeredAt || Date.now();
+        this.emitNativeCallState('connected', {
+            callId,
+            status: answerStatus,
+            stage: 'remote-answer-status-5'
+        });
         const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
         const answerAckSignal = this.buildAnswerAckSignal(call);
         const redialResponses = this.tryStatusFiveRedial(call, answerStatus, mediaTransportChanged);
@@ -515,6 +604,7 @@ class LinuxCallEngine {
             mediaWasActive: this.mediaEngine.active,
             mediaTransportChanged
         });
+        this.emitCallQualityChanged(answerStatus);
 
         if (!this.mediaEngineEnabled) {
             return [
@@ -529,9 +619,12 @@ class LinuxCallEngine {
         }
 
         if (!this.mediaEngine.active) {
-            return this.startMediaCall(
-                mediaTransportChanged ? 'remote-answer-status-5-transport-update' : 'remote-answer-status-5'
-            );
+            return [
+                answerAckSignal,
+                ...this.startMediaCall(
+                    mediaTransportChanged ? 'remote-answer-status-5-transport-update' : 'remote-answer-status-5'
+                )
+            ].filter(Boolean);
         }
 
         this.callWindow.update(call, this.currentMediaState);
@@ -640,7 +733,7 @@ class LinuxCallEngine {
         this.clearConnectedRemoteSilenceWatchdog();
         this.callRunning = false;
         this.currentMediaState = null;
-        this.mediaEngine.stop();
+        this.mediaEngine.stop({ zrtcEndCall: call });
         this.callWindow.close();
         if (this.currentCall && this.currentCall.callId === call.callId) {
             this.currentCall = null;
@@ -654,6 +747,8 @@ class LinuxCallEngine {
 
         const timer = setTimeout(() => {
             const nextRequest = Object.assign({}, requestData, {
+                callId: undefined,
+                id: undefined,
                 __linuxStatus5RedialAttempt: attempt
             });
 
@@ -773,6 +868,8 @@ class LinuxCallEngine {
         this.mediaEngine.stop();
         this.callWindow.close();
         this.currentCall = null;
+        this.emitNativeEvent('onCallAudioState', { state: '0' });
+        this.emitNativeEvent('onCallAutoHangup');
 
         return [
             ackSignal,
@@ -1032,6 +1129,13 @@ class LinuxCallEngine {
 
         this.currentMediaState = null;
         this.callRunning = true;
+        this.emitNativeEvent('onIncomingCall');
+        if (this.currentCall.transportConfig) {
+            this.emitInitZrtpWithServer(
+                this.currentCall.transportConfig.rtcpAddress,
+                this.currentCall.transportConfig.rtpAddress
+            );
+        }
         this.callWindow.open(this.currentCall, this.currentMediaState);
 
         const ringSignal = {
@@ -1116,6 +1220,10 @@ class LinuxCallEngine {
             const transportConfig = this.buildIncomingTransportConfig(data, this.currentCall);
             if (transportConfig) {
                 this.currentCall.transportConfig = transportConfig;
+                this.emitInitZrtpWithServer(
+                    transportConfig.rtcpAddress,
+                    transportConfig.rtpAddress
+                );
             }
         }
 
@@ -1125,6 +1233,7 @@ class LinuxCallEngine {
                 callId: this.currentCall.callId,
                 transport
             });
+            this.emitNativeEvent('onInitZrtpRequestFailed', { retCode: '-1' });
             return [
                 this.buildPopup(
                     'ZaloCall Linux',
@@ -1165,6 +1274,10 @@ class LinuxCallEngine {
 
         this.currentCall.state = 'incomingAnswer';
         this.currentCall.answeredAt = this.currentCall.answeredAt || Date.now();
+        this.emitNativeCallState('connected', {
+            callId: this.currentCall.callId,
+            stage: 'incoming-answer'
+        });
 
         const answerSignal = {
             type: 'sendSignal',
@@ -1205,6 +1318,11 @@ class LinuxCallEngine {
             this.currentCall.state = 'mediaStarted';
         }
         this.currentMediaState = result.data || this.currentMediaState || null;
+        this.emitNativeEvent('onCallAudioState', { state: '1' });
+        if (this.isVideoCall(this.currentCall)) {
+            this.emitCallVideoState(VIDEO_STATE.LOCAL_ON);
+            this.emitCallVideoState(VIDEO_STATE.REMOTE_ON);
+        }
         this.callWindow.open(this.currentCall, this.currentMediaState);
         if (this.currentCall.answeredAt) {
             this.scheduleConnectedRemoteSilenceWatchdog(reason);
@@ -1253,6 +1371,8 @@ class LinuxCallEngine {
         this.mediaEngine.stop({ zrtcEndCall: call });
         this.callWindow.close();
         this.currentCall = null;
+        this.emitNativeEvent('onCallAudioState', { state: '0' });
+        this.emitNativeEvent('onCallAutoHangup');
 
         if (!call) {
             return [this.buildCallState('free', { reason: 'local-end-no-call' })];
@@ -1673,6 +1793,10 @@ class LinuxCallEngine {
         this.mediaEngine.stop();
         this.callWindow.close();
         this.currentCall = null;
+        this.emitNativeEvent('onCallAudioState', { state: '0' });
+        this.emitNativeEvent('onCallErr', {
+            errCode: String(reason || 'unsupported-media')
+        });
 
         return [
             // Even unsupported media should clean up server state and write a
@@ -1848,7 +1972,15 @@ class LinuxCallEngine {
             return null;
         }
 
-        const callId = response.id || response.callId || this.currentCall.callId;
+        const callId = String(response.id || response.callId || this.currentCall.callId);
+        if (this.currentCall.callId !== callId) {
+            this.record('callIdUpdatedFromRequestResponse', {
+                previousCallId: this.currentCall.callId,
+                callId
+            });
+            this.currentCall.callId = callId;
+            this.lastOutgoingCallId = callId;
+        }
         this.rememberRemoteIdsFromSignalResponse(response);
         this.rememberLocalZrtcFieldsFromSignalResponse(response);
         const codec = this.selectAudioCodec(
@@ -1903,6 +2035,7 @@ class LinuxCallEngine {
             videoCodec: selectedVideoCodec,
             zrtcConfig: response.zrtc_config || null
         };
+        this.emitInitZrtpWithServer(rtcpAddress, rtpAddress);
 
         return payload;
     }
@@ -2679,6 +2812,7 @@ class LinuxCallEngine {
     }
 
     buildCallState(state, extra = {}) {
+        this.emitNativeCallState(state, extra);
         return {
             type: 'update',
             command: 'callState',
@@ -2686,14 +2820,413 @@ class LinuxCallEngine {
         };
     }
 
+    handleLocalMediaControl(data) {
+        if (!data || data.act_type !== 'voip') {
+            return false;
+        }
+
+        switch (data.act) {
+            case 'mute_audio':
+                this.localState.audioMuted = true;
+                this.emitNativeEvent('onCallAudioState', { state: '0' });
+                return true;
+            case 'unmute_audio':
+                this.localState.audioMuted = false;
+                this.emitNativeEvent('onCallAudioState', { state: '1' });
+                return true;
+            case 'hold_audio':
+                this.localState.audioHeld = true;
+                this.emitNativeEvent('onCallAudioState', { state: '2' });
+                return true;
+            case 'resume_audio':
+                this.localState.audioHeld = false;
+                this.emitNativeEvent('onCallAudioState', { state: '1' });
+                return true;
+            case 'stop_capture':
+                this.localState.captureStopped = true;
+                this.emitCallVideoState(VIDEO_STATE.LOCAL_OFF);
+                return true;
+            case 'start_capture':
+                this.localState.captureStopped = false;
+                this.emitCallVideoState(VIDEO_STATE.LOCAL_ON);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    changeAudioDevice(inputId, outputId) {
+        this.localState.defaultAudInputDevice = inputId;
+        this.localState.defaultAudOutputDevice = outputId;
+        this.record('changeAudioDevice', { inputId, outputId });
+    }
+
+    changeVideoDevice(id) {
+        this.localState.defaultVidDevice = id;
+        if (this.mediaEngine && typeof this.mediaEngine.setVideoDevice === 'function') {
+            this.mediaEngine.setVideoDevice(id);
+        }
+        this.record('changeVideoDevice', { id });
+    }
+
+    setAudioVolume(input, output) {
+        this.localState.audioInputVolume = input;
+        this.localState.audioOutputVolume = output;
+        this.record('setAudioVolume', { input, output });
+        return true;
+    }
+
+    setAgc(auto) {
+        this.localState.autoGainControl = !!auto;
+        this.record('setAgc', { auto: !!auto });
+    }
+
+    startDesktopCapture() {
+        this.localState.desktopCapture = true;
+        if (this.mediaEngine && typeof this.mediaEngine.setDesktopCapture === 'function') {
+            this.mediaEngine.setDesktopCapture(true);
+        }
+        if (!this.currentCall || this.isVideoCall(this.currentCall)) {
+            this.emitCallVideoState(VIDEO_STATE.LOCAL_ON);
+        }
+        this.record('startDesktopCapture', {});
+    }
+
+    stopDesktopCapture() {
+        this.localState.desktopCapture = false;
+        if (this.mediaEngine && typeof this.mediaEngine.setDesktopCapture === 'function') {
+            this.mediaEngine.setDesktopCapture(false);
+        }
+        this.emitCallVideoState(VIDEO_STATE.LOCAL_OFF);
+        this.record('stopDesktopCapture', {});
+    }
+
+    upgradeToVideoCall(options = {}) {
+        const call = this.currentCall;
+        if (!call) {
+            this.emitCallVideoState(VIDEO_STATE.LOCAL_OFF);
+            return [this.buildCallState('free', { reason: 'upgrade-video-no-call' })];
+        }
+
+        const transport = call.transportConfig || {};
+        const rtpAddress = this.getFirstValue(transport.rtpAddress, options.rtpAddress, options.rtpIP);
+        const rtcpAddress = this.getFirstValue(transport.rtcpAddress, options.rtcpAddress, options.rtcpIP, rtpAddress);
+        const videoCodec = this.selectVideoCodec(options, transport, options.extendData) ||
+            transport.videoCodec ||
+            this.getDefaultVideoCodec();
+        const mediaMode = {
+            zrtcMedia: transport.zrtcMedia,
+            srtpMode: transport.srtpMode,
+            newZrtc: transport.newZrtc,
+            packetMode: transport.packetMode
+        };
+        const extendData = call.incoming ?
+            this.buildIncomingAnswerExtendData(
+                this.getFirstValue(options.extendData, transport.extendData, '{}'),
+                rtpAddress,
+                rtcpAddress,
+                mediaMode,
+                videoCodec
+            ) :
+            this.buildOutgoingExtendData(
+                Object.assign({}, transport.zrtcConfig ? { zrtc_config: transport.zrtcConfig } : {}),
+                rtpAddress,
+                rtcpAddress,
+                mediaMode,
+                videoCodec
+            );
+
+        call.callType = 3;
+        call.transportConfig = Object.assign({}, transport, {
+            rtpAddress,
+            rtcpAddress,
+            videoEnabled: true,
+            videoCodec,
+            extendData
+        });
+        this.currentMediaState = null;
+        this.localState.captureStopped = false;
+        this.emitCallVideoState(VIDEO_STATE.LOCAL_ON);
+        this.emitCallChangeZRTP(0, {
+            rtpAddress,
+            rtcpAddress,
+            session: call.transportConfig.session
+        });
+        this.record('upgradeToVideoCall', {
+            callId: call.callId,
+            rtpAddress,
+            rtcpAddress,
+            videoCodec,
+            mediaActive: this.mediaEngine.active
+        });
+
+        const upgradeSignal = this.buildVideoUpgradeSignal(call);
+
+        if (!this.mediaEngineEnabled) {
+            return [
+                upgradeSignal,
+                this.buildCallState('calling', {
+                    callId: call.callId,
+                    reason: 'upgrade-video-without-media-engine',
+                    stage: 'video-enabled'
+                })
+            ].filter(Boolean);
+        }
+
+        if (this.mediaEngine.active) {
+            this.mediaEngine.stop();
+        }
+
+        return [
+            upgradeSignal,
+            ...this.startMediaCall('upgrade-to-video')
+        ].filter(Boolean);
+    }
+
+    buildVideoUpgradeSignal(call) {
+        if (!call || !call.transportConfig) {
+            return null;
+        }
+
+        const transport = call.transportConfig;
+        if (!transport.rtpAddress || !transport.rtcpAddress || !transport.session) {
+            return null;
+        }
+
+        const signal = {
+            type: 'sendSignal',
+            command: SIGNAL_COMMAND.REQUEST_TRANSPORT,
+            data: {
+                calleeId: this.getCallControlPeerId(call),
+                callId: call.callId,
+                rtcpAddress: transport.rtcpAddress,
+                rtpAddress: transport.rtpAddress,
+                codec: transport.codec || this.getAudioCodec(),
+                extendData: transport.extendData || '',
+                session: transport.session,
+                video: { enable: 1 }
+            }
+        };
+
+        this.record('sendSignal', {
+            command: signal.command,
+            data: signal.data,
+            reason: 'upgrade-to-video'
+        });
+
+        return signal;
+    }
+
+    changeMinMaxMobileBitrate(minBitrate, maxBitrate) {
+        this.localState.minMobileBitrate = minBitrate;
+        this.localState.maxMobileBitrate = maxBitrate;
+        this.record('changeMinMaxMobileBitrate', { minBitrate, maxBitrate });
+    }
+
+    setConfiguredTransport(config = {}) {
+        const next = {
+            rtpAddress: this.getFirstValue(config.rtpAddress, config.rtpIP),
+            rtcpAddress: this.getFirstValue(config.rtcpAddress, config.rtcpIP, config.rtpAddress, config.rtpIP),
+            session: this.getFirstValue(config.session, config.sessId),
+            codec: config.codec,
+            extendData: config.extendData,
+            callId: config.callId
+        };
+
+        this.localState.configuredTransport = Object.assign(
+            {},
+            this.localState.configuredTransport || {},
+            next
+        );
+
+        if (this.currentCall) {
+            this.currentCall.transportConfig = Object.assign(
+                {},
+                this.currentCall.transportConfig || {},
+                next
+            );
+        }
+
+        if (this.currentCall && next.rtpAddress && next.rtcpAddress) {
+            this.emitInitZrtpWithServer(next.rtcpAddress, next.rtpAddress);
+        }
+
+        this.record('setConfiguredTransport', next);
+    }
+
+    setMediaConfig(audioConfig, extendData) {
+        this.localState.mediaConfig = { audioConfig, extendData };
+
+        if (this.currentCall) {
+            this.currentCall.transportConfig = Object.assign(
+                {},
+                this.currentCall.transportConfig || {},
+                {
+                    codec: audioConfig || this.currentCall.transportConfig && this.currentCall.transportConfig.codec,
+                    extendData
+                }
+            );
+        }
+
+        this.record('setMediaConfig', { hasAudioConfig: !!audioConfig, hasExtendData: !!extendData });
+    }
+
+    updateCallerInfo(audioConfig, extendData) {
+        this.setMediaConfig(audioConfig, extendData);
+        const transport = this.currentCall && this.currentCall.transportConfig || this.localState.configuredTransport || {};
+        this.emitCallChangeZRTP(0, {
+            rtpAddress: transport.rtpAddress,
+            rtcpAddress: transport.rtcpAddress,
+            session: transport.session
+        });
+    }
+
+    emitInitZrtpWithServer(rtcpAddress, rtpAddress) {
+        if (!rtcpAddress || !rtpAddress) {
+            this.emitNativeEvent('onInitZrtpRequestFailed', { retCode: '-1' });
+            return;
+        }
+
+        this.emitNativeEvent('onInitZrtpWithServer', {
+            rtcp: String(rtcpAddress),
+            rtp: String(rtpAddress)
+        });
+    }
+
+    emitCallChangeZRTP(retCode, data = {}) {
+        this.emitNativeEvent('onCallChangeZRTP', {
+            retCode: String(retCode),
+            rtpAddr: String(data.rtpAddress || data.rtpAddr || ''),
+            rtcpAddr: String(data.rtcpAddress || data.rtcpAddr || ''),
+            sessionId: String(data.session || data.sessionId || '')
+        });
+    }
+
+    emitCallQualityChanged(quality) {
+        this.emitNativeEvent('onCallQualityChanged', {
+            quality: String(quality)
+        });
+    }
+
+    emitCallVideoState(state) {
+        const numeric = Number(state);
+        if (
+            numeric !== VIDEO_STATE.LOCAL_ON &&
+            numeric !== VIDEO_STATE.LOCAL_OFF &&
+            numeric !== VIDEO_STATE.REMOTE_ON &&
+            numeric !== VIDEO_STATE.REMOTE_OFF
+        ) {
+            return;
+        }
+
+        this.emitNativeEvent('onCallVideoState', {
+            state: String(numeric)
+        });
+    }
+
+    getCallInfo() {
+        const call = this.currentCall || {};
+        return {
+            callId: call.callId || null,
+            peerId: this.getCallControlPeerId(call) || null,
+            direction: call.incoming ? 'incoming' : (call.callId ? 'outgoing' : null),
+            state: call.state || (this.callRunning ? 'calling' : 'free'),
+            callType: call.callType || null,
+            startedAt: call.startedAt || null,
+            answeredAt: call.answeredAt || null,
+            media: this.currentMediaState || null,
+            local: this.localState || {}
+        };
+    }
+
+    getJsonStats406(startNetworkType = 0, endNetworkType = 0) {
+        return {
+            platform: 'linux',
+            startNetworkType,
+            endNetworkType,
+            call: this.getCallInfo(),
+            media: this.getMediaActivitySummary(),
+            ts: Date.now()
+        };
+    }
+
+    getExtendData() {
+        const transport = this.currentCall && this.currentCall.transportConfig;
+        return transport && transport.extendData ? transport.extendData : {};
+    }
+
+    emitNativeCallState(state, extra = {}) {
+        this.emitNativeEvent('onCallState', {
+            state: String(this.mapNativeCallState(state, extra))
+        });
+    }
+
+    mapNativeCallState(state, extra = {}) {
+        if (state === 'free') {
+            return 0;
+        }
+
+        if (
+            state === 'connected' ||
+            extra.stage === 'media-running' ||
+            extra.stage === 'media-started' ||
+            extra.stage === 'remote-answer' ||
+            extra.stage === 'incoming-answer' ||
+            extra.stage === 'request-accepted'
+        ) {
+            return 3;
+        }
+
+        if (extra.direction === 'incoming' || extra.stage === 'incoming-request') {
+            return 2;
+        }
+
+        return 1;
+    }
+
+    emitNativeEvent(type, data = {}) {
+        const event = Object.assign({ type }, data);
+        this.record('nativeEvent', event);
+        if (this.nativeEventsEnabled) {
+            this.nativeEventQueue.push(event);
+        }
+    }
+
+    drainNativeEvents() {
+        return this.nativeEventQueue.splice(0);
+    }
+
     shutdown() {
         this.clearConnectedRemoteSilenceWatchdog();
         this.mediaEngine.stop();
         this.callWindow.close();
+        this.emitNativeCallState('free', { reason: 'shutdown' });
     }
 
     createCallId() {
         return String(100000000 + crypto.randomInt(900000000));
+    }
+
+    createOutgoingCallId(data = {}) {
+        if (process.env.ZALO_LINUX_CALL_TRUST_CONFIG_CALL_ID === '1' && data.callId) {
+            this.lastOutgoingCallId = String(data.callId);
+            return this.lastOutgoingCallId;
+        }
+
+        let callId = this.createCallId();
+        while (callId === this.lastOutgoingCallId || (data.callId && callId === String(data.callId))) {
+            callId = this.createCallId();
+        }
+
+        if (data.callId && String(data.callId) !== callId) {
+            this.record('outgoingCallIdReplaced', {
+                providedCallId: String(data.callId),
+                callId
+            });
+        }
+
+        this.lastOutgoingCallId = callId;
+        return callId;
     }
 
     getAudioCodec() {

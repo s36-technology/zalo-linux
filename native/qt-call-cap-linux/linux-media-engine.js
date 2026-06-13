@@ -12,6 +12,9 @@ class LinuxMediaEngine {
         this.processes = [];
         this.relays = [];
         this.active = false;
+        this.videoDevice = null;
+        this.desktopCapture = false;
+        this.recentPorts = new Map();
     }
 
     getDeviceList() {
@@ -55,8 +58,7 @@ class LinuxMediaEngine {
             };
         }
 
-        const localPort = Number(process.env.ZALO_LINUX_CALL_LOCAL_RTP_PORT || 0) ||
-            (42000 + crypto.randomInt(10000));
+        const localPort = this.pickLocalPort('ZALO_LINUX_CALL_LOCAL_RTP_PORT', 42000);
         const codec = this.selectCodec(call.transportConfig.codec);
         const payload = this.getPayload(codec);
         const sampleRate = this.getSampleRate(codec);
@@ -241,11 +243,11 @@ class LinuxMediaEngine {
 
             try {
                 child.kill('SIGTERM');
+                this.scheduleGstForceKill(child);
             } catch (_) {}
         }
 
         for (const relay of this.relays.splice(0)) {
-            relay.closed = true;
             const delayedClose = this.sendZrtcEndCallPackets(relay, options.zrtcEndCall);
             this.record('mediaRelayStopped', this.getRelaySummary(relay));
 
@@ -435,7 +437,11 @@ class LinuxMediaEngine {
             return source.split(/\s+/);
         }
 
-        const device = String(process.env.ZALO_LINUX_CALL_VIDEO_DEVICE || '').trim();
+        if (this.desktopCapture) {
+            return this.buildDesktopVideoSourceArgs();
+        }
+
+        const device = String(this.videoDevice || process.env.ZALO_LINUX_CALL_VIDEO_DEVICE || '').trim();
         if (this.hasGstElement('v4l2src')) {
             return [
                 'v4l2src',
@@ -448,13 +454,39 @@ class LinuxMediaEngine {
         return ['autovideosrc'];
     }
 
+    buildDesktopVideoSourceArgs() {
+        if (this.hasGstElement('pipewiresrc')) {
+            return ['pipewiresrc'];
+        }
+
+        if (this.hasGstElement('ximagesrc')) {
+            return [
+                'ximagesrc',
+                'use-damage=false',
+                'show-pointer=true'
+            ];
+        }
+
+        return ['autovideosrc'];
+    }
+
     buildVideoSourceSummary() {
         const source = String(process.env.ZALO_LINUX_CALL_VIDEO_SOURCE || '').trim();
         if (source) {
             return source;
         }
 
-        const device = String(process.env.ZALO_LINUX_CALL_VIDEO_DEVICE || '').trim();
+        if (this.desktopCapture) {
+            if (this.hasGstElement('pipewiresrc')) {
+                return 'pipewiresrc desktop';
+            }
+
+            if (this.hasGstElement('ximagesrc')) {
+                return 'ximagesrc desktop';
+            }
+        }
+
+        const device = String(this.videoDevice || process.env.ZALO_LINUX_CALL_VIDEO_DEVICE || '').trim();
         if (this.hasGstElement('v4l2src')) {
             return device ?
                 `v4l2src device=${device} YUY2 640x480@30` :
@@ -462,6 +494,21 @@ class LinuxMediaEngine {
         }
 
         return 'autovideosrc';
+    }
+
+    setVideoDevice(id) {
+        this.videoDevice = id || null;
+        this.desktopCapture = false;
+        this.record('mediaVideoDeviceChanged', {
+            id: this.videoDevice
+        });
+    }
+
+    setDesktopCapture(enabled) {
+        this.desktopCapture = !!enabled;
+        this.record('mediaDesktopCaptureChanged', {
+            enabled: this.desktopCapture
+        });
     }
 
     getVideoEncoderElement() {
@@ -635,6 +682,7 @@ class LinuxMediaEngine {
         const child = spawn('gst-launch-1.0', args, {
             stdio: ['ignore', 'pipe', 'pipe']
         });
+        child.__zaloMediaName = name;
 
         child.stdout.setEncoding('utf8');
         child.stderr.setEncoding('utf8');
@@ -663,6 +711,26 @@ class LinuxMediaEngine {
         });
 
         return child;
+    }
+
+    scheduleGstForceKill(child) {
+        const delayMs = Math.max(150, Number(process.env.ZALO_LINUX_CALL_GST_FORCE_KILL_MS || 350));
+        const timer = setTimeout(() => {
+            if (!child || child.exitCode !== null || child.signalCode !== null) {
+                return;
+            }
+
+            try {
+                this.record('mediaForceKill', {
+                    name: child.__zaloMediaName || 'unknown',
+                    pid: child.pid || null,
+                    delayMs
+                });
+                child.kill('SIGKILL');
+            } catch (_) {}
+        }, delayMs);
+
+        if (timer.unref) timer.unref();
     }
 
     recordAudioLevel(name, message) {
@@ -800,6 +868,8 @@ class LinuxMediaEngine {
     }
 
     closeRelay(relay, delayed) {
+        relay.stopping = true;
+
         if (relay.zrtcInitTimer) {
             clearTimeout(relay.zrtcInitTimer);
             relay.zrtcInitTimer = null;
@@ -826,6 +896,7 @@ class LinuxMediaEngine {
         }
 
         const close = () => {
+            relay.closed = true;
             try {
                 relay.socket.close();
             } catch (_) {}
@@ -921,6 +992,7 @@ class LinuxMediaEngine {
             call,
             videoConfig,
             debugMedia: !!debugMedia,
+            stopping: false,
             closed: false
         };
 
@@ -945,6 +1017,10 @@ class LinuxMediaEngine {
         });
 
         relay.socket.on('message', (message, rinfo) => {
+            if (relay.stopping || relay.closed) {
+                return;
+            }
+
             if (!this.isRemoteEndpoint(relay, rinfo) && this.isLoopbackAddress(rinfo.address)) {
                 relay.localPackets += 1;
                 relay.localBytes += message.length;
@@ -1981,7 +2057,9 @@ class LinuxMediaEngine {
             subcmd = message.readUInt16LE(18);
             token = message.length >= 18 ? message.readUInt32LE(14) : null;
             remoteUserId = message.length >= 14 ? message.readUInt32LE(10) : null;
-            callId = message[0] === 1 && message.length >= 25 ? message.readUInt32LE(21) : null;
+            callId = (message[0] === 1 || subcmd === 3) && message.length >= 25 ?
+                message.readUInt32LE(21) :
+                null;
 
             if (message[0] === 2 && (subcmd === 11 || subcmd === 12)) {
                 resultCode = message.length >= 25 ? message.readUInt32LE(21) : null;
@@ -2000,7 +2078,7 @@ class LinuxMediaEngine {
             remoteUserId
         });
 
-        if (message[0] === 1 && subcmd === 3) {
+        if ((message[0] === 1 || message[0] === 2) && subcmd === 3) {
             const details = {
                 callId: callId ? String(callId) : null,
                 remoteUserId: remoteUserId ? String(remoteUserId) : null,
@@ -2694,6 +2772,29 @@ class LinuxMediaEngine {
         return String(address || '').replace(/^::ffff:/, '');
     }
 
+    pruneRecentPorts() {
+        const now = Date.now();
+        for (const [port, expiresAt] of this.recentPorts.entries()) {
+            if (expiresAt <= now) {
+                this.recentPorts.delete(port);
+            }
+        }
+    }
+
+    rememberRecentPort(port) {
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+            return;
+        }
+
+        const ttlMs = Math.max(1000, Number(process.env.ZALO_LINUX_CALL_PORT_REUSE_TTL_MS || 8000));
+        this.recentPorts.set(port, Date.now() + ttlMs);
+    }
+
+    isRecentPort(port) {
+        this.pruneRecentPorts();
+        return this.recentPorts.has(port);
+    }
+
     pickLocalPort(envName, base) {
         const configured = Number(process.env[envName] || 0);
         if (Number.isInteger(configured) && configured > 0 && configured <= 65535) {
@@ -2704,12 +2805,15 @@ class LinuxMediaEngine {
         const maxOffset = Math.max(1, Math.min(10000, 65535 - safeBase));
         for (let attempt = 0; attempt < 64; attempt += 1) {
             const port = safeBase + crypto.randomInt(maxOffset);
-            if (this.isUdpPortAvailable(port)) {
+            if (!this.isRecentPort(port) && this.isUdpPortAvailable(port)) {
+                this.rememberRecentPort(port);
                 return port;
             }
         }
 
-        return safeBase + crypto.randomInt(maxOffset);
+        const fallback = safeBase + crypto.randomInt(maxOffset);
+        this.rememberRecentPort(fallback);
+        return fallback;
     }
 
     isUdpPortAvailable(port) {

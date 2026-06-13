@@ -97,6 +97,19 @@ class ZCallController {
         this.backend.stopCapture(!!isStop);
     }
 
+    upgradeToVideoCall(options = {}) {
+        if (this.backend && typeof this.backend.upgradeToVideoCall === 'function') {
+            this.backend.upgradeToVideoCall(options);
+            return;
+        }
+
+        this.stopCapture(false);
+    }
+
+    switchToVideoCall(options = {}) {
+        this.upgradeToVideoCall(options);
+    }
+
     getCallInfo() {
         return this.backend.getCallInfo();
     }
@@ -165,6 +178,20 @@ class ZCallController {
 
     updateCallerInfo(audioConfig, extendData) {
         this.backend.updateCallerInfo(audioConfig, extendData);
+    }
+
+    answerIncomingCall() {
+        if (this.backend && typeof this.backend.answerIncomingCall === 'function') {
+            this.backend.answerIncomingCall();
+        }
+    }
+
+    answerCall() {
+        this.answerIncomingCall();
+    }
+
+    acceptCall() {
+        this.answerIncomingCall();
     }
 
     incomingCall(config, isVideoCall = true) {
