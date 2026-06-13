@@ -7,6 +7,17 @@ const path = require('path');
 const LinuxCallWindow = require('./linux-call-window');
 const LinuxMediaEngine = require('./linux-media-engine');
 
+const SIGNAL_COMMAND = Object.freeze({
+    REQUEST_CALL: 401,
+    ANSWER_INCOMING: 402,
+    CANCEL_CALL: 405,
+    END_CALL_LOG: 406,
+    RINGING: 407,
+    ANSWER_ACK: 408,
+    END_CALL: 409,
+    REQUEST_TRANSPORT: 416
+});
+
 class LinuxCallEngine {
     constructor({ log, send }) {
         this.log = log;
@@ -105,6 +116,7 @@ class LinuxCallEngine {
 
         const callId = this.createCallId();
         const callType = data.type || 1;
+        const statusFiveRedialAttempt = Number(data.__linuxStatus5RedialAttempt || 0);
 
         this.currentCall = {
             callId,
@@ -118,6 +130,8 @@ class LinuxCallEngine {
             startedAt: Date.now(),
             answeredAt: null,
             loggedBubble: false,
+            requestData: data,
+            statusFiveRedialAttempt,
             state: 'requesting'
         };
         this.currentMediaState = null;
@@ -131,7 +145,7 @@ class LinuxCallEngine {
         // HTTP/API call and later feeds the response back through recvSignal.
         const requestSignal = {
             type: 'sendSignal',
-            command: 401,
+            command: SIGNAL_COMMAND.REQUEST_CALL,
             data: {
                 calleeId: partner.id,
                 callId,
@@ -185,14 +199,14 @@ class LinuxCallEngine {
             return this.handleRemoteSignalEnd(command, data);
         }
 
-        if (command === 401) {
+        if (command === SIGNAL_COMMAND.REQUEST_CALL) {
             this.currentCall.state = 'requestCallResponse';
             // The 401 response contains server RTP/RTCP/session info. We map it
             // into the 416 sendRequestCall payload below.
             return this.tryBuildRequestSignal(data);
         }
 
-        if (command === 416) {
+        if (command === SIGNAL_COMMAND.REQUEST_TRANSPORT) {
             this.currentCall.state = 'requestAccepted';
 
             if (!this.mediaEngineEnabled) {
@@ -206,7 +220,7 @@ class LinuxCallEngine {
     }
 
     isRemoteEndRecvSignal(command, data) {
-        if (command !== 409 && command !== 405) {
+        if (command !== SIGNAL_COMMAND.END_CALL && command !== SIGNAL_COMMAND.CANCEL_CALL) {
             return false;
         }
 
@@ -223,7 +237,7 @@ class LinuxCallEngine {
             return false;
         }
 
-        if (command === 409) {
+        if (command === SIGNAL_COMMAND.END_CALL) {
             return !!(callId || payload.uidFrom || payload.uidTo);
         }
 
@@ -261,7 +275,11 @@ class LinuxCallEngine {
             act: `signal_${command}`,
             data: Object.assign({}, payload, {
                 callId,
-                status: this.getFirstValue(payload.status, params.status, command === 409 ? 3 : 6)
+                status: this.getFirstValue(
+                    payload.status,
+                    params.status,
+                    command === SIGNAL_COMMAND.END_CALL ? 3 : 6
+                )
             })
         });
     }
@@ -330,7 +348,7 @@ class LinuxCallEngine {
         const bubble = this.buildCallBubble(call, 'request-timeout');
         const cancelSignal = {
             type: 'sendSignal',
-            command: 405,
+            command: SIGNAL_COMMAND.CANCEL_CALL,
             data: {
                 toId: this.getEndSignalToId(call),
                 callId: call.callId,
@@ -409,6 +427,10 @@ class LinuxCallEngine {
             this.rememberRemoteIdsFromControl(data);
 
             const answerStatus = this.getControlStatus(data);
+            if (answerStatus === 5) {
+                return this.handleStatusFiveRemoteAnswer(data, answerStatus);
+            }
+
             if (!this.isConnectedAnswerControl(data)) {
                 this.record('remoteAnswerIgnored', {
                     callId: this.currentCall.callId,
@@ -467,6 +489,188 @@ class LinuxCallEngine {
         }
 
         return [];
+    }
+
+    handleStatusFiveRemoteAnswer(data, answerStatus) {
+        if (!this.currentCall) {
+            return [];
+        }
+
+        const call = this.currentCall;
+        const callId = call.callId;
+        call.state = 'remoteAnswerStatus5';
+        call.statusFiveNoMedia = true;
+        call.answeredAt = call.answeredAt || Date.now();
+        const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
+        const answerAckSignal = this.buildAnswerAckSignal(call);
+        const redialResponses = this.tryStatusFiveRedial(call, answerStatus, mediaTransportChanged);
+        if (redialResponses) {
+            return redialResponses;
+        }
+
+        this.record('remoteAnswerStatus5', {
+            callId,
+            status: answerStatus,
+            ack: !!answerAckSignal,
+            mediaWasActive: this.mediaEngine.active,
+            mediaTransportChanged
+        });
+
+        if (!this.mediaEngineEnabled) {
+            return [
+                answerAckSignal,
+                ...this.stopUnsupportedMediaCall('remote-answer-status-5-without-media-engine')
+            ].filter(Boolean);
+        }
+
+        if (mediaTransportChanged && this.mediaEngine.active) {
+            this.currentMediaState = null;
+            this.mediaEngine.stop();
+        }
+
+        if (!this.mediaEngine.active) {
+            return this.startMediaCall(
+                mediaTransportChanged ? 'remote-answer-status-5-transport-update' : 'remote-answer-status-5'
+            );
+        }
+
+        this.callWindow.update(call, this.currentMediaState);
+        this.scheduleConnectedRemoteSilenceWatchdog('remote-answer-status-5-media-running');
+
+        return [
+            answerAckSignal,
+            this.buildCallState('calling', {
+                callId,
+                reason: 'remote-answer-status-5',
+                stage: 'media-running',
+                status: answerStatus
+            })
+        ].filter(Boolean);
+    }
+
+    tryStatusFiveRedial(call, answerStatus, mediaTransportChanged) {
+        if (process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL !== '1') {
+            return null;
+        }
+
+        const maxAttempts = Math.max(0, Number(process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL_MAX || 3));
+        const attempt = Number(call.statusFiveRedialAttempt || 0);
+        if (attempt >= maxAttempts) {
+            return this.cancelStatusFiveCall(call, answerStatus, {
+                reason: 'status-5-redial-exhausted',
+                mediaTransportChanged
+            });
+        }
+
+        const requestData = call.requestData;
+        if (!requestData || !Array.isArray(requestData.partner) || !requestData.partner.length) {
+            return null;
+        }
+
+        const redialDelayMs = Math.max(0, Number(process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL_MS || 1600));
+        const cancelSignal = this.buildStatusFiveCancelSignal(call);
+
+        this.record('remoteAnswerStatus5Redial', {
+            callId: call.callId,
+            status: answerStatus,
+            attempt,
+            nextAttempt: attempt + 1,
+            delayMs: redialDelayMs,
+            mediaWasActive: this.mediaEngine.active,
+            mediaTransportChanged
+        });
+        this.teardownStatusFiveCall(call, cancelSignal, 'status-5-redial-cancel');
+
+        this.scheduleStatusFiveRedial(requestData, attempt + 1, redialDelayMs);
+
+        return [
+            cancelSignal,
+            this.buildCallState('calling', {
+                callId: call.callId,
+                reason: 'remote-answer-status-5-redial',
+                stage: 'redialing',
+                status: answerStatus
+            })
+        ];
+    }
+
+    cancelStatusFiveCall(call, answerStatus, details = {}) {
+        const cancelSignal = this.buildStatusFiveCancelSignal(call);
+
+        this.record('remoteAnswerStatus5Cancel', {
+            callId: call.callId,
+            status: answerStatus,
+            reason: details.reason,
+            attempt: call.statusFiveRedialAttempt || 0,
+            mediaWasActive: this.mediaEngine.active,
+            mediaTransportChanged: details.mediaTransportChanged
+        });
+
+        this.teardownStatusFiveCall(call, cancelSignal, details.reason || 'status-5-cancel');
+
+        return [
+            cancelSignal,
+            this.buildCallState('free', {
+                callId: call.callId,
+                reason: details.reason || 'remote-answer-status-5-cancelled',
+                status: answerStatus
+            })
+        ];
+    }
+
+    buildStatusFiveCancelSignal(call) {
+        return {
+            type: 'sendSignal',
+            command: SIGNAL_COMMAND.CANCEL_CALL,
+            data: {
+                toId: this.getEndSignalToId(call),
+                callId: call.callId,
+                callType: call.callType
+            }
+        };
+    }
+
+    teardownStatusFiveCall(call, cancelSignal, reason) {
+        this.record('sendSignal', {
+            command: cancelSignal.command,
+            data: cancelSignal.data,
+            reason
+        });
+
+        this.clearConnectedRemoteSilenceWatchdog();
+        this.callRunning = false;
+        this.currentMediaState = null;
+        this.mediaEngine.stop();
+        this.callWindow.close();
+        if (this.currentCall && this.currentCall.callId === call.callId) {
+            this.currentCall = null;
+        }
+    }
+
+    scheduleStatusFiveRedial(requestData, attempt, delayMs) {
+        if (!this.send) {
+            return;
+        }
+
+        const timer = setTimeout(() => {
+            const nextRequest = Object.assign({}, requestData, {
+                __linuxStatus5RedialAttempt: attempt
+            });
+
+            this.record('statusFiveRedialStart', {
+                attempt,
+                partnerCount: Array.isArray(nextRequest.partner) ? nextRequest.partner.length : 0,
+                type: nextRequest.type
+            });
+
+            for (const response of this.makeCall(nextRequest)) {
+                if (this.send) this.send(response);
+            }
+        }, delayMs);
+
+        if (timer.unref) {
+            timer.unref();
+        }
     }
 
     isRemoteHangupControl(data) {
@@ -653,7 +857,7 @@ class LinuxCallEngine {
 
         const signal = {
             type: 'sendSignal',
-            command: 409,
+            command: SIGNAL_COMMAND.END_CALL,
             data: {
                 toId,
                 callId
@@ -676,7 +880,7 @@ class LinuxCallEngine {
         call.answerAckSent = true;
         const signal = {
             type: 'sendSignal',
-            command: 408,
+            command: SIGNAL_COMMAND.ANSWER_ACK,
             data: {
                 calleeId: call.calleeId,
                 callId: call.callId
@@ -796,7 +1000,7 @@ class LinuxCallEngine {
         if (this.currentCall && this.currentCall.callId !== incomingCall.callId) {
             const busySignal = {
                 type: 'sendSignal',
-                command: 405,
+                command: SIGNAL_COMMAND.CANCEL_CALL,
                 data: {
                     toId: this.getCallControlPeerId(incomingCall),
                     callId: incomingCall.callId,
@@ -832,7 +1036,7 @@ class LinuxCallEngine {
 
         const ringSignal = {
             type: 'sendSignal',
-            command: 407,
+            command: SIGNAL_COMMAND.RINGING,
             data: {
                 callerId: this.getCallControlPeerId(this.currentCall),
                 callId: this.currentCall.callId
@@ -860,7 +1064,7 @@ class LinuxCallEngine {
         const staleCall = this.currentCall;
         const rejectSignal = {
             type: 'sendSignal',
-            command: 405,
+            command: SIGNAL_COMMAND.CANCEL_CALL,
             data: {
                 toId: this.getCallControlPeerId(incomingCall),
                 callId: incomingCall.callId,
@@ -964,7 +1168,7 @@ class LinuxCallEngine {
 
         const answerSignal = {
             type: 'sendSignal',
-            command: 402,
+            command: SIGNAL_COMMAND.ANSWER_INCOMING,
             data: {
                 callerId: this.getCallControlPeerId(this.currentCall),
                 callId: this.currentCall.callId,
@@ -1038,6 +1242,11 @@ class LinuxCallEngine {
         });
 
         const call = this.currentCall;
+        const mediaSummaryBeforeStop = this.getMediaActivitySummary();
+        const shouldCancelStatusFiveNoMedia = this.shouldCancelStatusFiveNoMediaCall(
+            call,
+            mediaSummaryBeforeStop
+        );
         this.clearConnectedRemoteSilenceWatchdog();
         this.callRunning = false;
         this.currentMediaState = null;
@@ -1049,17 +1258,17 @@ class LinuxCallEngine {
             return [this.buildCallState('free', { reason: 'local-end-no-call' })];
         }
 
-        // 409 is the normal connected hangup. Keep cancel as a delayed
-        // fallback because some peers only tear down on cancel, but sending
-        // both API calls in the same batch races the server control push.
+        // 409 is the normal connected hangup. A delayed 405 after successful
+        // outgoing calls can poison the next call into the status=5/no-media
+        // path, so keep that cancel fallback opt-in only.
         const endToId = this.getEndSignalToId(call);
         let signals;
 
-        if (call.answeredAt) {
+        if (call.answeredAt && !shouldCancelStatusFiveNoMedia) {
             signals = [
                 {
                     type: 'sendSignal',
-                    command: 409,
+                    command: SIGNAL_COMMAND.END_CALL,
                     data: {
                         toId: endToId,
                         callId: call.callId
@@ -1068,19 +1277,24 @@ class LinuxCallEngine {
             ];
 
             if (!call.incoming) {
-                this.scheduleDelayedSignal(
-                    {
-                        type: 'sendSignal',
-                        command: 405,
-                        data: {
-                            toId: endToId,
-                            callId: call.callId,
-                            callType: call.callType
-                        }
-                    },
-                    Number(process.env.ZALO_CALL_CONNECTED_CANCEL_FALLBACK_MS || 1200),
-                    'caller-connected-cancel-fallback'
+                const cancelFallbackDelayMs = Number(
+                    process.env.ZALO_CALL_CONNECTED_CANCEL_FALLBACK_MS || 0
                 );
+                if (cancelFallbackDelayMs > 0) {
+                    this.scheduleDelayedSignal(
+                        {
+                            type: 'sendSignal',
+                            command: SIGNAL_COMMAND.CANCEL_CALL,
+                            data: {
+                                toId: endToId,
+                                callId: call.callId,
+                                callType: call.callType
+                            }
+                        },
+                        cancelFallbackDelayMs,
+                        'caller-connected-cancel-fallback'
+                    );
+                }
             } else {
                 const numericToId = this.getIncomingNumericPeerId(call);
                 const endFallbackDelayMs = Number(
@@ -1091,7 +1305,7 @@ class LinuxCallEngine {
                     this.scheduleDelayedSignal(
                         {
                             type: 'sendSignal',
-                            command: 409,
+                            command: SIGNAL_COMMAND.END_CALL,
                             data: {
                                 toId: numericToId,
                                 callId: call.callId
@@ -1105,7 +1319,7 @@ class LinuxCallEngine {
                 this.scheduleDelayedSignal(
                     {
                         type: 'sendSignal',
-                        command: 405,
+                        command: SIGNAL_COMMAND.CANCEL_CALL,
                         data: {
                             toId: endToId,
                             callId: call.callId,
@@ -1117,10 +1331,17 @@ class LinuxCallEngine {
                 );
             }
         } else {
+            if (shouldCancelStatusFiveNoMedia) {
+                this.record('statusFiveNoMediaCancelOnHangup', {
+                    callId: call.callId,
+                    media: mediaSummaryBeforeStop
+                });
+            }
+
             signals = [
                 {
                     type: 'sendSignal',
-                    command: 405,
+                    command: SIGNAL_COMMAND.CANCEL_CALL,
                     data: {
                         toId: endToId,
                         callId: call.callId,
@@ -1146,6 +1367,14 @@ class LinuxCallEngine {
                 reason: 'local-end'
             })
         ].filter(Boolean);
+    }
+
+    shouldCancelStatusFiveNoMediaCall(call, summary) {
+        if (!call || !call.statusFiveNoMedia) {
+            return false;
+        }
+
+        return this.getRemoteMediaActivityCounter(summary) === 0;
     }
 
     shouldIgnoreFreshIncomingHangup(call, details) {
@@ -1338,7 +1567,7 @@ class LinuxCallEngine {
         const reason = 'remote-media-timeout';
         const endSignal = {
             type: 'sendSignal',
-            command: 409,
+            command: SIGNAL_COMMAND.END_CALL,
             data: {
                 toId: this.getEndSignalToId(call),
                 callId: call.callId
@@ -1359,7 +1588,7 @@ class LinuxCallEngine {
         this.scheduleDelayedSignal(
             {
                 type: 'sendSignal',
-                command: 405,
+                command: SIGNAL_COMMAND.CANCEL_CALL,
                 data: {
                     toId: this.getEndSignalToId(call),
                     callId: call.callId,
@@ -1450,7 +1679,7 @@ class LinuxCallEngine {
             // call bubble, otherwise the UI looks like the call never happened.
             {
                 type: 'sendSignal',
-                command: 405,
+                command: SIGNAL_COMMAND.CANCEL_CALL,
                 data: {
                     toId: this.getEndSignalToId(call),
                     callId: call.callId,
@@ -1520,7 +1749,7 @@ class LinuxCallEngine {
         const params = this.buildCallLogParams(call, reason, duration);
         const signal = {
             type: 'sendSignal',
-            command: 406,
+            command: SIGNAL_COMMAND.END_CALL_LOG,
             data: {
                 callId: call.callId,
                 partnerId: call.calleeId,
@@ -1582,7 +1811,7 @@ class LinuxCallEngine {
         // 416 confirms the transport selected from the 401 response.
         const requestSignal = {
             type: 'sendSignal',
-            command: 416,
+            command: SIGNAL_COMMAND.REQUEST_TRANSPORT,
             data: requestData
         };
 

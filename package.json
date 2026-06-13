@@ -1,7 +1,7 @@
 {
-  "name": "Zalo",
+  "name": "zalo-linux",
   "homepage": "https://zalo.me/",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Zalo - Nhắn gửi yêu thương",
   "packageManager": "yarn@1.22.22",
   "engines": {
@@ -24,7 +24,7 @@
     "build:appimage": "electron-builder --linux AppImage --publish never",
     "build:deb": "electron-builder --linux deb --publish never",
     "build:snap": "electron-builder --linux snap --publish never",
-    "dist": "electron-builder --publish always"
+    "dist": "electron-builder build --linux --publish always"
   },
   "main": "bootstrap.js",
   "keywords": [
@@ -168,7 +168,7 @@
     "artifactName": "${productName}-${version}-${arch}.${ext}",
     "asar": false,
     "directories": {
-      "output": "dist"
+      "output": "dist-electron"
     },
     "files": [
       "bootstrap.js",
@@ -179,7 +179,7 @@
       "pc-dist/**/*",
       "package.json",
       "!reverse-engineering/**/*",
-      "!dist/**/*",
+      "!dist-electron/**/*",
       "!node_modules/.cache/**/*"
     ],
     "linux": {
@@ -188,7 +188,7 @@
       ],
       "category": "Network",
       "icon": "pc-dist/favicon-512x512.png",
-      "executableName": "zalo",
+      "executableName": "zalo-linux",
       "synopsis": "Zalo Messenger",
       "description": "Unofficial Linux port of Zalo desktop."
     },
