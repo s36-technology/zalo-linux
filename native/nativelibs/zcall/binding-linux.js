@@ -398,7 +398,7 @@ class LinuxZCallBinding {
             fromId: config.fromId,
             userId: config.userId,
             protocol: config.protocol,
-            callId: config.callId,
+            providedCallId: config.callId,
             sessId: config.sessId || config.session,
             settings: config.settings,
             zrtc_config: config.zrtc_config,

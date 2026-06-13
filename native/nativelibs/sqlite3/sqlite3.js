@@ -3,8 +3,8 @@ var sqlite3 = require('./sqlite3-binding.js');
 var EventEmitter = require('events').EventEmitter;
 module.exports = exports = sqlite3;
 
-function normalizeMethod(fn) {
-    return function(sql) {
+function normalizeMethod (fn) {
+    return function (sql) {
         var errBack;
         var args = Array.prototype.slice.call(arguments, 1);
         if (typeof args[args.length - 1] === 'function') {
@@ -34,14 +34,12 @@ sqlite3.cached = {
 
         var db;
         file = path.resolve(file);
-
-        function cb() {
-            callback.call(db, null);
-        }
+        function cb() { callback.call(db, null); }
 
         if (!sqlite3.cached.objects[file]) {
             db = sqlite3.cached.objects[file] = new Database(file, a, b);
-        } else {
+        }
+        else {
             // Make sure the callback is called.
             db = sqlite3.cached.objects[file];
             var callback = (typeof a === 'number') ? b : a;
@@ -67,9 +65,9 @@ inherits(Backup, EventEmitter);
 
 // Database#prepare(sql, [bind1, bind2, ...], [callback])
 Database.prototype.prepare = normalizeMethod(function(statement, params) {
-    return params.length ?
-        statement.bind.apply(statement, params) :
-        statement;
+    return params.length
+        ? statement.bind.apply(statement, params)
+        : statement;
 });
 
 // Database#run(sql, [bind1, bind2, ...], [callback])
@@ -125,8 +123,7 @@ Statement.prototype.map = function() {
         if (err) return callback(err);
         var result = {};
         if (rows.length) {
-            var keys = Object.keys(rows[0]),
-                key = keys[0];
+            var keys = Object.keys(rows[0]), key = keys[0];
             if (keys.length > 2) {
                 // Value is an object
                 for (var i = 0; i < rows.length; i++) {
@@ -147,7 +144,7 @@ Statement.prototype.map = function() {
 
 var isVerbose = false;
 
-var supportedEvents = ['trace', 'profile', 'insert', 'update', 'delete'];
+var supportedEvents = [ 'trace', 'profile', 'insert', 'update', 'delete' ];
 
 Database.prototype.addListener = Database.prototype.on = function(type) {
     var val = EventEmitter.prototype.addListener.apply(this, arguments);
@@ -186,7 +183,7 @@ sqlite3.verbose = function() {
             'map',
             'close',
             'exec'
-        ].forEach(function(name) {
+        ].forEach(function (name) {
             trace.extendTrace(Database.prototype, name);
         });
         [
@@ -198,7 +195,7 @@ sqlite3.verbose = function() {
             'map',
             'reset',
             'finalize',
-        ].forEach(function(name) {
+        ].forEach(function (name) {
             trace.extendTrace(Statement.prototype, name);
         });
         isVerbose = true;

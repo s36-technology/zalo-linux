@@ -186,9 +186,9 @@ class LinuxCallEngine {
                 {
                     callId,
                     session: this.getFirstValue(
-                        this.localState.configuredTransport.session,
                         data.sessId,
-                        data.session
+                        data.session,
+                        this.localState.configuredTransport.session
                     )
                 }
             );
@@ -3030,7 +3030,7 @@ class LinuxCallEngine {
             session: this.getFirstValue(config.session, config.sessId),
             codec: config.codec,
             extendData: config.extendData,
-            callId: config.callId
+            callId: this.currentCall ? this.currentCall.callId : config.callId
         };
 
         this.localState.configuredTransport = Object.assign(
@@ -3208,19 +3208,20 @@ class LinuxCallEngine {
     }
 
     createOutgoingCallId(data = {}) {
-        if (process.env.ZALO_LINUX_CALL_TRUST_CONFIG_CALL_ID === '1' && data.callId) {
-            this.lastOutgoingCallId = String(data.callId);
+        const providedCallId = this.getFirstValue(data.callId, data.providedCallId);
+        if (process.env.ZALO_LINUX_CALL_TRUST_CONFIG_CALL_ID === '1' && providedCallId) {
+            this.lastOutgoingCallId = String(providedCallId);
             return this.lastOutgoingCallId;
         }
 
         let callId = this.createCallId();
-        while (callId === this.lastOutgoingCallId || (data.callId && callId === String(data.callId))) {
+        while (callId === this.lastOutgoingCallId || (providedCallId && callId === String(providedCallId))) {
             callId = this.createCallId();
         }
 
-        if (data.callId && String(data.callId) !== callId) {
+        if (providedCallId && String(providedCallId) !== callId) {
             this.record('outgoingCallIdReplaced', {
-                providedCallId: String(data.callId),
+                providedCallId: String(providedCallId),
                 callId
             });
         }

@@ -1,13 +1,17 @@
+
+
 function getLib() {
 
     let addon = null;
-    if (process.platform === 'win32') {
-        if (process.arch === 'x64') {
+    if(process.platform === 'win32') {
+        if(process.arch === 'x64') {
             addon = require('./win64/addon');
-        } else {
+        }
+        else {
             addon = require('./win32/addon');
         }
-    } else {
+    }
+    else {
         return {
             stat: () => {},
             diskInfo: () => {},
@@ -17,9 +21,9 @@ function getLib() {
 
     /**
      * Stat thông tin file/folder
-     * @param {*} path 
-     * @param {*} isFolder 
-     * @returns 
+     * @param {*} path
+     * @param {*} isFolder
+     * @returns
      */
     const stat = async (path, isFolder) => {
         return addon.getInfo(path, isFolder);
@@ -28,7 +32,7 @@ function getLib() {
     /**
      * Hàm này lấy thông tin ổ đĩa hiện có trong máy
      * Note: đang support cho win only
-     * @returns 
+     * @returns
      */
     const diskInfo = async () => {
         return addon.getDiskInfo();
@@ -36,16 +40,16 @@ function getLib() {
 
     /**
      * Hàm này lấy stat folder nhanh chóng
-     * @param {*} folderPath 
+     * @param {*} folderPath
      */
     const statFolder = async (folderPath) => {
         return addon.getInfo(folderPath, true);
     }
 
     /**
-     * 
-     * @param {*} src 
-     * @param {*} dest 
+     *
+     * @param {*} src
+     * @param {*} dest
      * @param {*} callback (err, results)
      */
     const copyFolder = async (src, dest, callback) => {
@@ -53,7 +57,7 @@ function getLib() {
     }
 
     /**
-     * 
+     *
      */
     const cancelCopy = async () => {
         return addon.cancelCopy();
@@ -61,8 +65,8 @@ function getLib() {
 
     /**
      * Hàm kiểm tra một file/folder có quyền đọc và ghi hay không
-     * @param {*} path 
-     * @returns 
+     * @param {*} path
+     * @returns
      */
     const canReadAndWrite = (path) => {
         return addon.canReadAndWrite(path);
@@ -70,8 +74,8 @@ function getLib() {
 
     /**
      * Hàm kiểm tra một file/folder có quyền đọc hay không
-     * @param {*} path 
-     * @returns 
+     * @param {*} path
+     * @returns
      */
     const canRead = (path) => {
         return addon.canRead(path);
@@ -79,8 +83,8 @@ function getLib() {
 
     /**
      * Hàm kiểm tra một file/folder có quyền ghi hay không
-     * @param {*} path 
-     * @returns 
+     * @param {*} path
+     * @returns
      */
     const canWrite = (path) => {
         return addon.canWrite(path);

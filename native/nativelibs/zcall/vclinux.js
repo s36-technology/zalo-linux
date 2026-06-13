@@ -4,7 +4,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 const path = require('path');
-const ZCallBinding = require('./binding.js');
+const ZCallBinding = require('./binding-linux.js');
 
 const NO_INSTANCE_ERROR = -100;
 const LOGIN_URL = 'https://vlogin.zaloapp.com/login';

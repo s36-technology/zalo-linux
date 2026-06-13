@@ -1,51 +1,51 @@
+
 let CachedModule = {};
-
-function createUnsupportedModule() {
-    const fail = () => {
-        throw {
-            error: 'LIB_ERR',
-            message: 'mp4thumb native module is not available for this platform'
-        };
-    };
-
-    return {
-        MP4Thumb: function MP4Thumb() {
-            return {
-                generateThumbnailAsync: fail,
-                generateThumbnail: fail,
-                cancel: fail
-            };
-        }
-    };
-}
 
 function getLib() {
     let thumbModule = null;
     try {
-        if (process.platform === 'win32') {
+        if(process.platform === 'win32') {
             thumbModule = require(`./win32/${process.arch}/mp4thumb.node`);
-        } else if (process.platform === 'darwin') {
-            if (process.arch === 'arm64') {
+        }
+        else {
+            if(process.arch === 'arm64'){
+                // thumbModule = require('./darwin-arm64/mp4thumb.node');
                 thumbModule = require('./darwin-arm64/mp4thumb.node');
-            } else {
+            }
+            else {
                 thumbModule = require('./darwin-x64/mp4thumb.node');
             }
-        } else {
-            thumbModule = createUnsupportedModule();
         }
-    } catch (e) {
-        thumbModule = createUnsupportedModule();
+    }
+    catch(e) {
+        console.error(`Failed to load mp4thumb module: ${e.message}`);
+        // throw new Error(`Module mp4thumb cannot be loaded for ${process.platform}-${process.arch}`);
+        thumbModule = new class {
+            MP4Thumb() {
+                return {
+                    generateThumbnailAsync: () => {
+                        throw {error: 'LIB_ERR', message: 'Failed to load mp4thumb module'};
+                    },
+                    generateThumbnail: () => {
+                        throw {error: 'LIB_ERR', message: 'Failed to load mp4thumb module'};
+                    },
+                    cancel: () => {
+                        throw {error: 'LIB_ERR', message: 'Failed to load mp4thumb module'};
+                    }
+                }
+            }
+        }();
     }
 
     /**
-     * Generate a thumbnail from a video file path
-     * @param {string} inputPath - Path to the input video file
-     * @param {string} outputPath - Path where the thumbnail should be saved
-     * @param {number} [maxWidth] - Optional max width for this specific thumbnail
-     * @param {number} [maxHeight] - Optional max height for this specific thumbnail
-     * @param {string} mediaId - Media ID
-     * @returns {Promise<boolean>} - True if successful
-     */
+    * Generate a thumbnail from a video file path
+    * @param {string} inputPath - Path to the input video file
+    * @param {string} outputPath - Path where the thumbnail should be saved
+    * @param {number} [maxWidth] - Optional max width for this specific thumbnail
+    * @param {number} [maxHeight] - Optional max height for this specific thumbnail
+    * @param {string} mediaId - Media ID
+    * @returns {Promise<boolean>} - True if successful
+    */
     const generateThumbnail = async (inputPath, outputPath, maxWidth, maxHeight, mediaId) => {
         return new Promise((resolve, reject) => {
             const thumb = new thumbModule.MP4Thumb();
@@ -60,14 +60,8 @@ function getLib() {
             try {
                 if (typeof thumb.generateThumbnailAsync === 'function') {
                     thumb.generateThumbnailAsync(inputPath, outputPath, maxWidth, maxHeight)
-                        .then((ok) => {
-                            done();
-                            resolve(ok);
-                        })
-                        .catch((err) => {
-                            done();
-                            reject(err);
-                        });
+                        .then((ok) => { done(); resolve(ok); })
+                        .catch((err) => { done(); reject(err); });
                 } else {
                     const ok = thumb.generateThumbnail(inputPath, outputPath, maxWidth, maxHeight);
                     done();
