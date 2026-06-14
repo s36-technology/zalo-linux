@@ -28,6 +28,7 @@ let sendSocket = null;
 let shuttingDown = false;
 const engine = new LinuxCallEngine({ log, send: sendToMain });
 let callTimeout = null;
+let latestCallConfig = {};
 
 function log(message, data) {
     const line = `[${new Date().toISOString()}] ${message}${data ? ` ${JSON.stringify(data)}` : ''}\n`;
@@ -156,7 +157,7 @@ function handleCommand(message) {
 
     if (message.command === 'makeCall') {
         clearCallTimeout();
-        for (const response of engine.makeCall(message.data)) {
+        for (const response of engine.makeCall(buildMakeCallPayload(message.data))) {
             sendToMain(response);
         }
         scheduleCallTimeout();
@@ -181,6 +182,7 @@ function handleCommand(message) {
     }
 
     if (message.command === 'init' || message.command === 'updateLocal') {
+        latestCallConfig = Object.assign({}, latestCallConfig, message.data || {});
         sendToMain(engine.init(message.data));
         return;
     }
@@ -191,6 +193,42 @@ function handleCommand(message) {
             sendToMain(response);
         }
         scheduleCallTimeout();
+    }
+}
+
+function buildMakeCallPayload(data) {
+    const payload = Object.assign({}, latestCallConfig || {}, data || {});
+    const callId = getFirstValue(payload.callId, payload.id);
+
+    if (!callId || String(callId) === '0') {
+        payload.callId = generateCallId();
+    }
+
+    log('makeCall payload prepared', {
+        callId: payload.callId,
+        type: payload.type,
+        partnerCount: Array.isArray(payload.partner) ? payload.partner.length : 0
+    });
+
+    return payload;
+}
+
+function getFirstValue(...values) {
+    for (const value of values) {
+        if (value !== undefined && value !== null && value !== '') {
+            return value;
+        }
+    }
+
+    return null;
+}
+
+function generateCallId() {
+    try {
+        const value = crypto.randomBytes(4).readUInt32BE(0);
+        return String(100000000 + (value % 900000000));
+    } catch (_) {
+        return String(100000000 + (Date.now() % 900000000));
     }
 }
 

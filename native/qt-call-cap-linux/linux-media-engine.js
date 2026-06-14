@@ -5,10 +5,11 @@ const crypto = require('crypto');
 const dgram = require('dgram');
 
 class LinuxMediaEngine {
-    constructor({ log, record, onRemoteEnd }) {
+    constructor({ log, record, onRemoteEnd, onRemoteMedia }) {
         this.log = log;
         this.record = record;
         this.onRemoteEnd = typeof onRemoteEnd === 'function' ? onRemoteEnd : null;
+        this.onRemoteMedia = typeof onRemoteMedia === 'function' ? onRemoteMedia : null;
         this.processes = [];
         this.relays = [];
         this.active = false;
@@ -1576,6 +1577,7 @@ class LinuxMediaEngine {
         } else {
             relay.zrtcRemoteAudioPackets += 1;
         }
+        this.notifyRemoteMedia(relay, mediaKind, message);
 
         const payloadField = mediaKind === 'video' ? 'remoteVideoPayload' : 'remotePlainPayload';
         if (relay[payloadField] === null && remotePayload !== null) {
@@ -1601,6 +1603,23 @@ class LinuxMediaEngine {
         this.noteRtpPayloadRewrite(relay, 'remote-to-local', remotePayload, targetPayload);
 
         return this.rewriteRtpPayloadType(message, targetPayload);
+    }
+
+    notifyRemoteMedia(relay, mediaKind, message) {
+        if (!this.onRemoteMedia) {
+            return;
+        }
+
+        const flag = mediaKind === 'video' ? 'remoteVideoMediaNotified' : 'remoteAudioMediaNotified';
+        if (relay[flag]) {
+            return;
+        }
+
+        relay[flag] = true;
+        this.onRemoteMedia(Object.assign(this.getRelaySummary(relay), {
+            mediaKind,
+            bytes: message.length
+        }));
     }
 
     getRemoteVideoRejectReason(relay, message, payload) {

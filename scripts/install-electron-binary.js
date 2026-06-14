@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 
 const electronRoot = path.join(__dirname, "..", "node_modules", "electron");
+const projectRoot = path.join(__dirname, "..");
 
 if (!fs.existsSync(electronRoot)) {
   process.exit(0);
@@ -16,6 +17,7 @@ const pathFile = path.join(electronRoot, "path.txt");
 const platformPath = getPlatformPath(process.platform);
 
 if (isElectronInstalled()) {
+  syncPackagedLinuxCallFiles();
   process.exit(0);
 }
 
@@ -45,6 +47,8 @@ async function installElectron() {
   if (!isElectronInstalled()) {
     throw new Error("Electron binary install did not produce a runnable dist.");
   }
+
+  syncPackagedLinuxCallFiles();
 }
 
 function isElectronInstalled() {
@@ -75,5 +79,47 @@ function getPlatformPath(platform) {
       return "electron.exe";
     default:
       throw new Error(`Electron builds are not available for ${platform}.`);
+  }
+}
+
+function syncPackagedLinuxCallFiles() {
+  if (process.platform !== "linux") {
+    return;
+  }
+
+  const packagedAppRoot = path.join(
+    projectRoot,
+    "dist",
+    "linux-unpacked",
+    "resources",
+    "app"
+  );
+
+  if (!fs.existsSync(packagedAppRoot)) {
+    return;
+  }
+
+  const files = [
+    "native/nativelibs/zcall/binding-linux.js",
+    "native/nativelibs/zcall/index.js",
+    "native/nativelibs/zcall/vclinux.js",
+    "native/qt-call-cap-linux/call-window-main.js",
+    "native/qt-call-cap-linux/call-window-preload.js",
+    "native/qt-call-cap-linux/linux-call-engine.js",
+    "native/qt-call-cap-linux/linux-call-window.js",
+    "native/qt-call-cap-linux/linux-media-engine.js",
+    "native/qt-call-cap-linux/preload-call-support.js",
+    "native/qt-call-cap-linux/zalo-call-mock.js"
+  ];
+
+  for (const relativePath of files) {
+    const sourcePath = path.join(projectRoot, relativePath);
+    const targetPath = path.join(packagedAppRoot, relativePath);
+
+    if (!fs.existsSync(sourcePath) || !fs.existsSync(path.dirname(targetPath))) {
+      continue;
+    }
+
+    fs.copyFileSync(sourcePath, targetPath);
   }
 }

@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -102,6 +103,13 @@ class LinuxZCallBinding {
     enqueueProtocolEvent(message) {
         if (message) {
             this.protocolQueue.push(message);
+            if (this.callback) {
+                try {
+                    this.callback();
+                } catch (error) {
+                    this.log('callback failed', { message: error.message });
+                }
+            }
         }
     }
 
@@ -176,13 +184,16 @@ class LinuxZCallBinding {
             osInfo,
             clientVersion
         };
+        this.engine.clearConfiguredTransport();
     }
 
     setConfigData(config) {
         // Some call sites may talk to the binding directly instead of going
-        // through vcmac.js. Accept that richer object too.
-        this.config = Object.assign({}, this.config, config || {});
+        // through vcmac.js. Match native _initCallConfig: each call receives
+        // a fresh config object instead of inheriting callId/session/transport.
+        this.config = Object.assign({}, config || {});
         this.settings = this.config.settings || this.settings || {};
+        this.engine.clearConfiguredTransport();
         return Promise.resolve(true);
     }
 
@@ -193,7 +204,11 @@ class LinuxZCallBinding {
             rtcpAddress,
             rtpAddress
         });
-        this.engine.setConfiguredTransport(this.config);
+        if (rtcpAddress || rtpAddress) {
+            this.engine.setConfiguredTransport(this.config);
+        } else {
+            this.engine.clearConfiguredTransport();
+        }
         this.enqueueNativeEvents();
     }
 
@@ -298,7 +313,7 @@ class LinuxZCallBinding {
     }
 
     getEventMessage() {
-        const event = this.eventQueue.shift();
+        const event = this.protocolQueue.shift() || this.eventQueue.shift();
         return event ? JSON.stringify(event) : null;
     }
 
@@ -386,6 +401,7 @@ class LinuxZCallBinding {
 
     buildMakeCallPayload() {
         const config = this.config || {};
+        const callId = this.ensureOutgoingCallId(config);
         const partner = {
             id: this.getFirstValue(config.toId, config.partnerId, config.calleeId),
             avatar: this.getFirstValue(config.partnerAvatar, config.avatar),
@@ -398,7 +414,7 @@ class LinuxZCallBinding {
             fromId: config.fromId,
             userId: config.userId,
             protocol: config.protocol,
-            providedCallId: config.callId,
+            callId,
             sessId: config.sessId || config.session,
             settings: config.settings,
             zrtc_config: config.zrtc_config,
@@ -464,6 +480,26 @@ class LinuxZCallBinding {
         }
 
         return null;
+    }
+
+    ensureOutgoingCallId(config) {
+        const callId = this.getFirstValue(config.callId, config.id);
+        if (callId && String(callId) !== '0') {
+            return callId;
+        }
+
+        const generatedCallId = this.generateCallId();
+        config.callId = generatedCallId;
+        return generatedCallId;
+    }
+
+    generateCallId() {
+        try {
+            const value = crypto.randomBytes(4).readUInt32BE(0);
+            return String(100000000 + (value % 900000000));
+        } catch (_) {
+            return String(100000000 + (Date.now() % 900000000));
+        }
     }
 }
 
