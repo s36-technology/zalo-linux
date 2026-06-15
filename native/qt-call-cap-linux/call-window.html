@@ -217,6 +217,11 @@
         return;
       }
 
+      if (currentCall.connecting) {
+        statusEl.textContent = 'Connecting...';
+        return;
+      }
+
       statusEl.textContent = currentCall.incoming ? 'Incoming call' : 'Calling...';
     }
 

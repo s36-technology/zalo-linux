@@ -72,6 +72,18 @@ class VCLinux {
         this.instance.stopCapture(isStop);
     }
 
+    switchCamera() {
+        if (typeof this.instance.switchCamera === 'function') {
+            this.instance.switchCamera();
+        }
+    }
+
+    setPartnerOffCamera(status) {
+        if (typeof this.instance.setPartnerOffCamera === 'function') {
+            this.instance.setPartnerOffCamera(status);
+        }
+    }
+
     upgradeToVideoCall(options = {}) {
         if (typeof this.instance.upgradeToVideoCall === 'function') {
             this.instance.upgradeToVideoCall(options);
@@ -187,6 +199,18 @@ class VCLinux {
 
     getCallInfo() {
         return this.instance.getCallInfo();
+    }
+
+    isInCall() {
+        return typeof this.instance.isInCall === 'function' ?
+            this.instance.isInCall() :
+            false;
+    }
+
+    isInVideoCall() {
+        return typeof this.instance.isInVideoCall === 'function' ?
+            this.instance.isInVideoCall() :
+            false;
     }
 
     getJsonStats406(startNetworkType = 0, endNetworkType = 0) {

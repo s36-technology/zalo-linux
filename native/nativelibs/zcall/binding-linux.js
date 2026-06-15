@@ -14,6 +14,7 @@ const NATIVE_EVENT_TYPES = new Set([
     'onCallAudioState',
     'onCallAutoHangup',
     'onCallChangeZRTP',
+    'onCallErr',
     'onCallQualityChanged',
     'onCallState',
     'onCallVideoState',
@@ -64,7 +65,7 @@ class LinuxZCallBinding {
         this.engine = new LinuxCallEngine({
             log: this.log.bind(this),
             send: this.enqueueEngineEvent.bind(this),
-            nativeEvents: true
+            onNativeEvent: this.enqueueNativeEvent.bind(this)
         });
     }
 
@@ -100,6 +101,12 @@ class LinuxZCallBinding {
         this.enqueueNativeEvents();
     }
 
+    enqueueNativeEvent(event) {
+        if (NATIVE_EVENT_TYPES.has(event && event.type)) {
+            this.enqueueEvent(event);
+        }
+    }
+
     enqueueProtocolEvent(message) {
         if (message) {
             this.protocolQueue.push(message);
@@ -127,9 +134,7 @@ class LinuxZCallBinding {
         }
 
         for (const event of this.engine.drainNativeEvents()) {
-            if (NATIVE_EVENT_TYPES.has(event && event.type)) {
-                this.enqueueEvent(event);
-            }
+            this.enqueueNativeEvent(event);
         }
     }
 
@@ -346,6 +351,11 @@ class LinuxZCallBinding {
         this.enqueueNativeEvents();
     }
 
+    switchCamera() {
+        this.engine.switchCamera();
+        this.enqueueNativeEvents();
+    }
+
     setAgc(auto) {
         this.engine.setAgc(!!auto);
         this.enqueueNativeEvents();
@@ -365,6 +375,11 @@ class LinuxZCallBinding {
         this.enqueueNativeEvents();
     }
 
+    setPartnerOffCamera(status) {
+        this.engine.setPartnerOffCamera(status);
+        this.enqueueNativeEvents();
+    }
+
     upgradeToVideoCall(options = {}) {
         this.enqueueResponses(this.engine.upgradeToVideoCall(Object.assign({}, this.config, options || {})));
     }
@@ -381,6 +396,14 @@ class LinuxZCallBinding {
     getExtendData() {
         const extendData = this.engine.getExtendData() || this.config.extendData || {};
         return typeof extendData === 'string' ? extendData : JSON.stringify(extendData);
+    }
+
+    isInCall() {
+        return this.engine.isInCall();
+    }
+
+    isInVideoCall() {
+        return this.engine.isInVideoCall();
     }
 
     getActiveAudioCodecs() {

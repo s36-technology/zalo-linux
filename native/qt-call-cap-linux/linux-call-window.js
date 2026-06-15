@@ -156,7 +156,8 @@ class LinuxCallWindow {
             answeredAt: call && call.answeredAt,
             direction: call && call.direction,
             incoming: !!(call && call.incoming),
-            ringing: !!(call && !call.incoming && !call.answeredAt),
+            connecting: !!(call && call.statusFivePendingConnect && !call.answeredAt),
+            ringing: !!(call && !call.incoming && !call.answeredAt && !call.statusFivePendingConnect),
             state: call && call.state,
             media: mediaState || null
         };

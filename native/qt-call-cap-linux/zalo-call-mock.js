@@ -26,7 +26,11 @@ const logPath = process.env.ZALO_CALL_LOG || process.env.ZALO_CALL_MOCK_LOG || p
 let recvSocket = null;
 let sendSocket = null;
 let shuttingDown = false;
-const engine = new LinuxCallEngine({ log, send: sendToMain });
+const engine = new LinuxCallEngine({
+    log,
+    send: sendToMain,
+    onNativeEvent: sendToMain
+});
 let callTimeout = null;
 let latestCallConfig = {};
 
@@ -155,6 +159,33 @@ function handleCommand(message) {
         return;
     }
 
+    if (message.command === 'getCallInfo') {
+        sendToMain({
+            type: 'response',
+            command: 'getCallInfo',
+            data: engine.getCallInfo()
+        });
+        return;
+    }
+
+    if (message.command === 'isInCall') {
+        sendToMain({
+            type: 'response',
+            command: 'isInCall',
+            data: engine.isInCall()
+        });
+        return;
+    }
+
+    if (message.command === 'isInVideoCall') {
+        sendToMain({
+            type: 'response',
+            command: 'isInVideoCall',
+            data: engine.isInVideoCall()
+        });
+        return;
+    }
+
     if (message.command === 'makeCall') {
         clearCallTimeout();
         for (const response of engine.makeCall(buildMakeCallPayload(message.data))) {
@@ -169,6 +200,16 @@ function handleCommand(message) {
         for (const response of engine.handleEndCall()) {
             sendToMain(response);
         }
+        return;
+    }
+
+    if (message.command === 'switchCamera') {
+        engine.switchCamera();
+        return;
+    }
+
+    if (message.command === 'setPartnerOffCamera') {
+        engine.setPartnerOffCamera(message.data && message.data.status);
         return;
     }
 

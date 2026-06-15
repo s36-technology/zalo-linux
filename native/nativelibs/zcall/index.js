@@ -103,6 +103,18 @@ class ZVCMac{
 		this.zmac.stopCapture(!!isStop);
 	}
 
+	switchCamera(){
+		if(this.zmac && typeof this.zmac.switchCamera === 'function'){
+			this.zmac.switchCamera();
+		}
+	}
+
+	setPartnerOffCamera(status){
+		if(this.zmac && typeof this.zmac.setPartnerOffCamera === 'function'){
+			this.zmac.setPartnerOffCamera(status);
+		}
+	}
+
 	upgradeToVideoCall(options = {}){
 		if(this.zmac && typeof this.zmac.upgradeToVideoCall === 'function'){
 			this.zmac.upgradeToVideoCall(options);
@@ -117,6 +129,14 @@ class ZVCMac{
 
 	getCallInfo(){
 		return this.zmac.getCallInfo();
+	}
+
+	isInCall(){
+		return this.zmac && typeof this.zmac.isInCall === 'function' ? this.zmac.isInCall() : false;
+	}
+
+	isInVideoCall(){
+		return this.zmac && typeof this.zmac.isInVideoCall === 'function' ? this.zmac.isInVideoCall() : false;
 	}
 
 	getJsonStats406(startNetworkType  = 0, endNetworkType = 0){

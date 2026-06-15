@@ -2282,7 +2282,7 @@ class LinuxMediaEngine {
     }
 
     shouldDualSendPlainMedia(relay) {
-        if (!relay.zrtcMediaEnabled || process.env.ZALO_LINUX_CALL_ZRTC_DUAL_SEND !== '1') {
+        if (!relay.zrtcMediaEnabled || process.env.ZALO_LINUX_CALL_ZRTC_DUAL_SEND === '0') {
             return false;
         }
 
