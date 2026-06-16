@@ -37,6 +37,8 @@ class LinuxCallEngine {
         this.nativeEventQueue = [];
         this.localState = {};
         this.lastOutgoingCallId = null;
+        this.lastCallEndedAt = 0;
+        this.pendingOutgoingCallTimer = null;
         this.connectedRemoteSilenceTimer = null;
         this.statusFivePendingConnectTimer = null;
         this.experimental = process.env.ZALO_LINUX_CALL_EXPERIMENTAL === '1';
@@ -155,6 +157,11 @@ class LinuxCallEngine {
             ];
         }
 
+        const cooldownDelayMs = this.getOutgoingCooldownDelay(data);
+        if (cooldownDelayMs > 0) {
+            return this.deferOutgoingCall(data, cooldownDelayMs);
+        }
+
         if (this.currentCall || this.callRunning) {
             return [
                 this.buildCallState('calling', {
@@ -245,6 +252,62 @@ class LinuxCallEngine {
         ];
     }
 
+    getOutgoingCooldownDelay(data = {}) {
+        if (
+            !this.lastCallEndedAt ||
+            data.__linuxCooldownBypass ||
+            data.__linuxStatus5RedialAttempt
+        ) {
+            return 0;
+        }
+
+        const cooldownMs = Math.max(0, Number(process.env.ZALO_CALL_OUTGOING_COOLDOWN_MS || 6000));
+        if (!cooldownMs) {
+            return 0;
+        }
+
+        const elapsedMs = Date.now() - this.lastCallEndedAt;
+        return elapsedMs < cooldownMs ? cooldownMs - elapsedMs : 0;
+    }
+
+    deferOutgoingCall(data, delayMs) {
+        if (this.pendingOutgoingCallTimer) {
+            return [
+                this.buildCallState('calling', {
+                    reason: 'outgoing-cooldown-pending',
+                    stage: 'waiting-for-previous-call-cleanup',
+                    delayMs
+                })
+            ];
+        }
+
+        this.record('outgoingCallDeferredAfterRecentEnd', {
+            delayMs
+        });
+
+        this.pendingOutgoingCallTimer = setTimeout(() => {
+            this.pendingOutgoingCallTimer = null;
+            const nextRequest = Object.assign({}, data, {
+                __linuxCooldownBypass: true
+            });
+            for (const response of this.makeCall(nextRequest)) {
+                if (this.send) this.send(response);
+            }
+        }, delayMs);
+
+        if (this.pendingOutgoingCallTimer.unref) {
+            this.pendingOutgoingCallTimer.unref();
+        }
+
+        return [
+            this.buildCallState('calling', {
+                reason: 'outgoing-cooldown',
+                stage: 'waiting-for-previous-call-cleanup',
+                delayMs
+            })
+        ];
+    }
+
     handleRecvSignal(command, data) {
         this.record('recvSignal', { command, data });
         this.log('linux call recvSignal', { command, hasCall: !!this.currentCall });
@@ -322,8 +385,14 @@ class LinuxCallEngine {
             data
         });
 
-        if (process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK === '0') {
-            return [];
+        if (this.shouldHoldStatusFiveForRemoteMedia()) {
+            return [
+                this.buildCallState('calling', {
+                    callId: this.currentCall.callId,
+                    reason: 'status-5-answer-ack-pending-media',
+                    stage: 'status-5-pending-connect'
+                })
+            ];
         }
 
         return this.completePendingStatusFiveAnswer('status-5-answer-ack');
@@ -344,15 +413,16 @@ class LinuxCallEngine {
         );
 
         if (callId && this.currentCall && this.currentCall.callId !== String(callId)) {
-            if (!this.isCurrentCallPeerOrSessionSignal(payload, params)) {
-                return false;
-            }
-
-            this.record('remoteSignalEndCallIdMismatchAccepted', {
+            this.record('remoteSignalEndCallIdMismatchIgnored', {
                 command,
                 currentCallId: this.currentCall.callId,
                 signalCallId: String(callId)
             });
+            return false;
+        }
+
+        if (!callId && !this.isCurrentCallPeerOrSessionSignal(payload, params)) {
+            return false;
         }
 
         if (command === SIGNAL_COMMAND.END_CALL) {
@@ -485,12 +555,21 @@ class LinuxCallEngine {
             return [];
         }
 
-        if (this.currentCall.statusFivePendingConnect && this.mediaEngine.active) {
-            this.record('timeoutIgnoredStatus5PendingConnect', {
+        if (this.currentCall.statusFivePendingConnect) {
+            const call = this.currentCall;
+            this.record('timeoutStatus5PendingConnectNoMedia', {
                 callId,
-                state: this.currentCall.state
+                state: call.state,
+                mediaActive: this.mediaEngine.active
             });
-            return [];
+            this.log('linux call status 5 pending connect timeout', {
+                callId,
+                state: call.state,
+                mediaActive: this.mediaEngine.active
+            });
+            return this.cancelStatusFiveCall(call, 5, {
+                reason: 'status-5-pending-connect-timeout'
+            });
         }
 
         this.record('timeout', {
@@ -583,11 +662,15 @@ class LinuxCallEngine {
             ];
         }
 
-        if (this.isRemoteHangupControl(data)) {
-            return this.handleRemoteEndControl(data);
-        }
-
         if (data.act === 'answer' && this.currentCall) {
+            if (this.hasMismatchedControlCallId(data)) {
+                this.record('remoteAnswerCallIdMismatchIgnored', {
+                    currentCallId: this.currentCall.callId,
+                    controlCallId: this.getControlCallId(data)
+                });
+                return [];
+            }
+
             if (this.currentCall.incoming) {
                 return this.handleAnswerIncomingCall(data);
             }
@@ -680,6 +763,10 @@ class LinuxCallEngine {
             ];
         }
 
+        if (this.isRemoteHangupControl(data)) {
+            return this.handleRemoteEndControl(data);
+        }
+
         return [];
     }
 
@@ -688,6 +775,10 @@ class LinuxCallEngine {
             return false;
         }
 
+        return !this.statusFiveAnswerHasExtendMediaMode(data);
+    }
+
+    statusFiveAnswerHasExtendMediaMode(data) {
         const payload = this.unwrapControlData(data);
         const params = this.parseParams(payload.params);
         const extendData = this.getFirstValue(
@@ -700,11 +791,7 @@ class LinuxCallEngine {
             extend.packetMode !== undefined ||
             Array.isArray(extend.serverAddr);
 
-        if (hasExtendMediaMode) {
-            return false;
-        }
-
-        return true;
+        return hasExtendMediaMode;
     }
 
     handleStatusFiveRemoteAnswer(data, answerStatus) {
@@ -721,7 +808,7 @@ class LinuxCallEngine {
         const answerAckSignal = this.shouldAckStatusFiveAnswer() ?
             this.buildAnswerAckSignal(call) :
             null;
-        const redialResponses = this.tryStatusFiveRedial(call, answerStatus, mediaTransportChanged);
+        const redialResponses = this.tryStatusFiveRedial(call, answerStatus, mediaTransportChanged, data);
         if (redialResponses) {
             return redialResponses;
         }
@@ -839,7 +926,8 @@ class LinuxCallEngine {
     }
 
     shouldHoldStatusFiveForRemoteMedia() {
-        return process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA === '1';
+        return process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA !== '0' &&
+            process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK !== '1';
     }
 
     completePendingStatusFiveAnswer(reason) {
@@ -874,18 +962,36 @@ class LinuxCallEngine {
         ];
     }
 
-    tryStatusFiveRedial(call, answerStatus, mediaTransportChanged) {
-        if (process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL !== '1') {
+    shouldAutoRedialStatusFive(data) {
+        if (process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL === '0') {
+            return false;
+        }
+
+        if (process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL === '1') {
+            return true;
+        }
+
+        return !this.statusFiveAnswerHasExtendMediaMode(data);
+    }
+
+    tryStatusFiveRedial(call, answerStatus, mediaTransportChanged, data) {
+        if (!this.shouldAutoRedialStatusFive(data)) {
             return null;
         }
 
-        const maxAttempts = Math.max(0, Number(process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL_MAX || 3));
+        const maxAttempts = Math.max(0, Number(process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL_MAX || 1));
         const attempt = Number(call.statusFiveRedialAttempt || 0);
         if (attempt >= maxAttempts) {
-            return this.cancelStatusFiveCall(call, answerStatus, {
+            this.record('remoteAnswerStatus5RedialSkipped', {
+                callId: call.callId,
+                status: answerStatus,
                 reason: 'status-5-redial-exhausted',
+                attempt,
+                maxAttempts,
+                mediaWasActive: this.mediaEngine.active,
                 mediaTransportChanged
             });
+            return null;
         }
 
         const requestData = call.requestData;
@@ -905,7 +1011,9 @@ class LinuxCallEngine {
             mediaWasActive: this.mediaEngine.active,
             mediaTransportChanged
         });
-        this.teardownStatusFiveCall(call, cancelSignal, 'status-5-redial-cancel');
+        this.teardownStatusFiveCall(call, cancelSignal, 'status-5-redial-cancel', {
+            keepWindow: true
+        });
 
         this.scheduleStatusFiveRedial(requestData, attempt + 1, redialDelayMs);
 
@@ -956,7 +1064,7 @@ class LinuxCallEngine {
         };
     }
 
-    teardownStatusFiveCall(call, cancelSignal, reason) {
+    teardownStatusFiveCall(call, cancelSignal, reason, options = {}) {
         this.record('sendSignal', {
             command: cancelSignal.command,
             data: cancelSignal.data,
@@ -964,7 +1072,9 @@ class LinuxCallEngine {
         });
 
         this.mediaEngine.stop({ zrtcEndCall: call });
-        this.callWindow.close();
+        if (!options.keepWindow) {
+            this.callWindow.close();
+        }
         this.resetActiveCallState();
     }
 
@@ -1001,6 +1111,10 @@ class LinuxCallEngine {
             return false;
         }
 
+        if (data.act === 'answer') {
+            return false;
+        }
+
         const payload = this.unwrapControlData(data);
         const params = this.parseParams(payload.params);
         const callId = this.getFirstValue(
@@ -1011,15 +1125,16 @@ class LinuxCallEngine {
         );
 
         if (this.currentCall && callId && this.currentCall.callId !== String(callId)) {
-            if (!this.isCurrentCallPeerOrSessionSignal(payload, params)) {
-                return false;
-            }
-
-            this.record('remoteHangupCallIdMismatchAccepted', {
+            this.record('remoteHangupCallIdMismatchIgnored', {
                 currentCallId: this.currentCall.callId,
                 controlCallId: String(callId),
                 act: data.act
             });
+            return false;
+        }
+
+        if (this.currentCall && !callId && !this.isCurrentCallPeerOrSessionSignal(payload, params)) {
+            return false;
         }
 
         if (this.isRemoteCancelAct(data.act) || this.isRemoteEndAct(data.act)) {
@@ -1046,6 +1161,26 @@ class LinuxCallEngine {
 
         // endcall API sends status 3; cancel/reject controls commonly use 6.
         return status === 3 || status === 6;
+    }
+
+    getControlCallId(data) {
+        const payload = this.unwrapControlData(data);
+        const params = this.parseParams(payload.params);
+        return this.getFirstValue(
+            payload.callId,
+            payload.id,
+            params.callId,
+            params.id
+        );
+    }
+
+    hasMismatchedControlCallId(data) {
+        const callId = this.getControlCallId(data);
+        return !!(
+            this.currentCall &&
+            callId &&
+            this.currentCall.callId !== String(callId)
+        );
     }
 
     normalizeControlAct(act) {
@@ -2277,13 +2412,24 @@ class LinuxCallEngine {
             nestedCandidate,
             this.currentCall
         );
-        const selectedVideoCodec = videoCodec || (
-            this.isVideoCall(this.currentCall) ? this.getDefaultVideoCodec() : null
-        );
-        const videoEnabled = this.isVideoCall(this.currentCall) || !!videoCodec;
-        const selectedExtendData = videoEnabled ?
-            this.buildOutgoingExtendData(response, rtpAddress, rtcpAddress, mediaMode, selectedVideoCodec) :
+        const shouldAdvertiseVideo = this.isVideoCall(this.currentCall);
+        const selectedVideoCodec = shouldAdvertiseVideo ?
+            (videoCodec || this.getDefaultVideoCodec()) :
+            null;
+        const videoEnabled = shouldAdvertiseVideo || !!selectedVideoCodec;
+        const shouldSendExtendData = !!extendData ||
+            mediaMode.zrtcMedia ||
+            !!response.zrtc_config ||
+            !!(nestedCandidate && nestedCandidate.zrtc_config) ||
+            videoEnabled;
+        const selectedExtendData = shouldSendExtendData ?
+            this.buildOutgoingExtendData(response, rtpAddress, rtcpAddress, mediaMode, selectedVideoCodec, {
+                includeVideo: shouldAdvertiseVideo
+            }) :
             extendData;
+        const outboundSrtpMode = selectedExtendData ? this.getLinuxSrtpMode() : mediaMode.srtpMode;
+        const outboundNewZrtc = mediaMode.newZrtc !== undefined ? mediaMode.newZrtc : (selectedExtendData ? 1 : undefined);
+        const outboundPacketMode = mediaMode.packetMode !== undefined ? mediaMode.packetMode : (selectedExtendData ? 2 : undefined);
 
         const payload = {
             calleeId: this.currentCall.calleeId,
@@ -2294,9 +2440,9 @@ class LinuxCallEngine {
             session,
             callId,
             zrtcMedia: mediaMode.zrtcMedia,
-            srtpMode: mediaMode.srtpMode,
-            newZrtc: mediaMode.newZrtc,
-            packetMode: mediaMode.packetMode
+            srtpMode: outboundSrtpMode,
+            newZrtc: outboundNewZrtc,
+            packetMode: outboundPacketMode
         };
 
         // Keep Linux-only runtime hints out of the 416 payload. The renderer
@@ -2630,9 +2776,10 @@ class LinuxCallEngine {
         };
     }
 
-    buildOutgoingExtendData(response, rtpAddress, rtcpAddress, mediaMode, videoCodec) {
+    buildOutgoingExtendData(response, rtpAddress, rtcpAddress, mediaMode, videoCodec, options = {}) {
         const zrtcConfig = this.getFirstObject(response && response.zrtc_config);
-        const selectedVideoCodec = videoCodec || this.getDefaultVideoCodec();
+        const includeVideo = options.includeVideo !== undefined ? !!options.includeVideo : !!videoCodec;
+        const selectedVideoCodec = includeVideo ? (videoCodec || this.getDefaultVideoCodec()) : null;
         const server = {
             bonus: 0,
             rtcp: rtcpAddress,
@@ -2644,7 +2791,7 @@ class LinuxCallEngine {
         // for the peer. For video calls it must advertise callType=1 and H264,
         // otherwise the peer accepts audio only even when the UI button was video.
         return JSON.stringify({
-            callType: 1,
+            callType: includeVideo ? 1 : 0,
             gccAudio: this.getFirstValue(zrtcConfig.gccAudio ? 1 : undefined, 1),
             gccMode: this.getFirstValue(zrtcConfig.gccMode, 1),
             gccSVLR: 1,
@@ -2662,9 +2809,9 @@ class LinuxCallEngine {
             supportCallBusy: 1,
             supportHevcDecode: this.getLinuxHevcDecodeSupport(),
             tpType: 0,
-            video: {
+            video: includeVideo ? {
                 codec: selectedVideoCodec ? [selectedVideoCodec] : []
-            }
+            } : undefined
         });
     }
 
@@ -3002,7 +3149,7 @@ class LinuxCallEngine {
             return [single];
         }
 
-        return [0, 5];
+        return [0, 3, 5];
     }
 
     collectIds(...values) {
@@ -3520,13 +3667,26 @@ class LinuxCallEngine {
     }
 
     shutdown() {
+        this.clearPendingOutgoingCall();
         this.mediaEngine.stop();
         this.callWindow.close();
         this.resetActiveCallState();
         this.emitNativeCallState('free', { reason: 'shutdown' });
     }
 
+    clearPendingOutgoingCall() {
+        if (!this.pendingOutgoingCallTimer) {
+            return;
+        }
+
+        clearTimeout(this.pendingOutgoingCallTimer);
+        this.pendingOutgoingCallTimer = null;
+    }
+
     resetActiveCallState() {
+        if (this.currentCall) {
+            this.lastCallEndedAt = Date.now();
+        }
         this.clearConnectedRemoteSilenceWatchdog();
         this.clearStatusFivePendingConnectFallback();
         this.callRunning = false;

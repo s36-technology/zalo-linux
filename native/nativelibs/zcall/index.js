@@ -237,6 +237,7 @@ class ZVCMac{
 				return;
 			}
 			// this.test();
+			this.zmac.setCallback();
 			this.zmac.setConfigData(config, false, isVideoCall)
 				.then(()=>{
 					this.zmac.incomingCall();
