@@ -380,22 +380,58 @@ class LinuxCallEngine {
             return [];
         }
 
-        this.record('answerAckStatus5Connect', {
+        this.record('answerAckStatus5Pending', {
             callId: this.currentCall.callId,
             data
         });
 
-        if (this.shouldHoldStatusFiveForRemoteMedia()) {
-            return [
-                this.buildCallState('calling', {
-                    callId: this.currentCall.callId,
-                    reason: 'status-5-answer-ack-pending-media',
-                    stage: 'status-5-pending-connect'
-                })
-            ];
+        if (process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK === '1') {
+            return this.completePendingStatusFiveAnswer('status-5-answer-ack');
         }
 
-        return this.completePendingStatusFiveAnswer('status-5-answer-ack');
+        return [
+            this.buildCallState('calling', {
+                callId: this.currentCall.callId,
+                reason: 'status-5-answer-ack-pending-media',
+                stage: 'status-5-pending-connect'
+            })
+        ];
+    }
+
+    handleStatusFiveAcceptedControl(data) {
+        if (
+            !this.currentCall ||
+            this.currentCall.incoming ||
+            !this.currentCall.statusFivePendingConnect ||
+            this.currentCall.answeredAt ||
+            !this.isStatusFiveAcceptedControl(data)
+        ) {
+            return null;
+        }
+
+        this.record('remoteAnswerStatus5AcceptedControl', {
+            callId: this.currentCall.callId,
+            act: data && data.act
+        });
+
+        this.handleLocalMediaControl(data);
+        return this.completePendingStatusFiveAnswer(`status-5-${data.act}`);
+    }
+
+    isStatusFiveAcceptedControl(data) {
+        if (!data || data.act_type !== 'voip') {
+            return false;
+        }
+
+        switch (data.act) {
+            case 'mute_audio':
+            case 'unmute_audio':
+            case 'hold_audio':
+            case 'resume_audio':
+                return true;
+            default:
+                return false;
+        }
     }
 
     isRemoteEndRecvSignal(command, data) {
@@ -557,19 +593,12 @@ class LinuxCallEngine {
 
         if (this.currentCall.statusFivePendingConnect) {
             const call = this.currentCall;
-            this.record('timeoutStatus5PendingConnectNoMedia', {
+            this.record('timeoutIgnoredStatus5PendingConnect', {
                 callId,
                 state: call.state,
                 mediaActive: this.mediaEngine.active
             });
-            this.log('linux call status 5 pending connect timeout', {
-                callId,
-                state: call.state,
-                mediaActive: this.mediaEngine.active
-            });
-            return this.cancelStatusFiveCall(call, 5, {
-                reason: 'status-5-pending-connect-timeout'
-            });
+            return [];
         }
 
         this.record('timeout', {
@@ -651,6 +680,11 @@ class LinuxCallEngine {
 
         if (data.act === 'start_capture' && this.currentCall && !this.isVideoCall(this.currentCall)) {
             return this.upgradeToVideoCall(data.data || {});
+        }
+
+        const statusFiveAcceptedResponses = this.handleStatusFiveAcceptedControl(data);
+        if (statusFiveAcceptedResponses) {
+            return statusFiveAcceptedResponses;
         }
 
         if (this.handleLocalMediaControl(data)) {
@@ -880,7 +914,7 @@ class LinuxCallEngine {
     scheduleStatusFivePendingConnectFallback(callId) {
         this.clearStatusFivePendingConnectFallback();
 
-        const delayMs = Math.max(0, Number(process.env.ZALO_CALL_STATUS_5_CONNECT_FALLBACK_MS || 0));
+        const delayMs = Math.max(0, Number(process.env.ZALO_CALL_STATUS_5_CONNECT_FALLBACK_MS || 4500));
         if (!delayMs) {
             return;
         }
@@ -926,8 +960,7 @@ class LinuxCallEngine {
     }
 
     shouldHoldStatusFiveForRemoteMedia() {
-        return process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA !== '0' &&
-            process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK !== '1';
+        return process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA === '1';
     }
 
     completePendingStatusFiveAnswer(reason) {
@@ -954,7 +987,7 @@ class LinuxCallEngine {
         this.scheduleConnectedRemoteSilenceWatchdog(reason);
 
         return [
-            this.buildCallState('calling', {
+            this.buildCallState('connected', {
                 callId: call.callId,
                 reason,
                 stage: 'media-running'

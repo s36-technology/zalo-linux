@@ -1131,6 +1131,15 @@ class LinuxMediaEngine {
         relay.zrtcWrappedLocalPackets += 1;
         relay.zrtcWrappedLocalBytes += packet.length;
 
+        const outgoingPackets = [];
+        if (this.shouldDualSendPlainMedia(relay)) {
+            relay.zrtcDualLocalPackets += 1;
+            this.noteZrtcDualSend(relay, message.length);
+            outgoingPackets.push(this.preparePlainLocalMediaPacket(relay, message));
+        }
+
+        outgoingPackets.push(packet);
+
         if (this.shouldDualSendZrtcWrappers(relay, token || 0)) {
             const fallbackPacket = this.buildZrtcMediaPacket(relay, message, token || 0, false, {
                 forceLong: true
@@ -1139,23 +1148,11 @@ class LinuxMediaEngine {
             if (!fallbackPacket.equals(packet)) {
                 relay.zrtcDualWrapperPackets += 1;
                 this.noteZrtcDualWrapperSend(relay, message.length);
-                return [
-                    packet,
-                    fallbackPacket
-                ];
+                outgoingPackets.push(fallbackPacket);
             }
         }
 
-        if (this.shouldDualSendPlainMedia(relay)) {
-            relay.zrtcDualLocalPackets += 1;
-            this.noteZrtcDualSend(relay, message.length);
-            return [
-                this.preparePlainLocalMediaPacket(relay, message),
-                packet
-            ];
-        }
-
-        return [packet];
+        return outgoingPackets;
     }
 
     rememberLocalRtpPacket(relay, message) {
@@ -2291,7 +2288,11 @@ class LinuxMediaEngine {
         }
 
         if (!this.isZrtcAnswerDowngraded(relay)) {
-            return false;
+            return !!(
+                relay.call &&
+                !relay.call.incoming &&
+                relay.zrtcRemoteAudioPackets === 0
+            );
         }
 
         const maxPackets = Math.max(0, Number(process.env.ZALO_LINUX_CALL_ZRTC_DUAL_SEND_PACKETS || 1500));
