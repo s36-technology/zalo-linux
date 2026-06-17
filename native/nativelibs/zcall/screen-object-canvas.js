@@ -14,7 +14,7 @@ class ZScreenObject{
 		this.frameBuff = new Buffer(1920*1080*4);
 		this.name = name;
 		this.getSizeContainer = getSizeContainer;
-
+		
 		this.gl = this.createCanvas(this.canvas);
 		if(!this.gl){
 			this.enable = false;
@@ -25,7 +25,7 @@ class ZScreenObject{
 		// this.initDrawGl();
 		this.drawScene = this.drawScene.bind(this);
 		this.drawBuff = this.drawBuff.bind(this);
-		this.getFrame = this.getFrame.bind(this);
+		this.getFrame = this.getFrame.bind(this);		
 		this.stop = this.stop.bind(this);
 	}
 
@@ -39,7 +39,7 @@ class ZScreenObject{
 	}
 
 	setSizeCanvas(config){
-		if(!this.enable || !this.gl) return;
+		if(!this.enable || !this.gl) return;		
 		this.canvas.width = config.width;
 		this.canvas.height = config.height;
 		this.config = config;
@@ -53,33 +53,33 @@ class ZScreenObject{
 	}
 
 	createCanvas(canvas) {
-		let gl = null;
-		// Try to grab the standard context. If it fails, fallback to experimental.
-		gl = canvas.getContext('2d');
+		let gl = null;  
+	  	// Try to grab the standard context. If it fails, fallback to experimental.
+	  	gl = canvas.getContext('2d');  
 	  // If we don't have a GL context, give up now
-		if (!gl) {
-		this.error('Unable to initialize cavas 2d. Your browser may not support it.');
-		}
-		return gl;
+	  	if (!gl) {
+	    	this.error('Unable to initialize cavas 2d. Your browser may not support it.');
+	  	}  
+	  	return gl;
 	}
 	//render by hand
-	render(){
-		if(this.enable)
+	render(){	
+		if(this.enable) 
 			this.drawScene();
 	}
 	//render automatically
 	startRender(){
-		this.lastTime = new Date().getTime();
+		this.lastTime = new Date().getTime();		
 		requestAnimationFrame(this.drawScene);
 	}
 	getFrame(){
 		return this.source(this.frameBuff);
 	}
-	drawScene(){
+	drawScene(){		
 		if(!this.enable) return;
 		let data = this.getFrame();
 		if(data){
-			this.drawBuff(data);
+			this.drawBuff(data);			
 		}
 	}
 	_shouldUpdate(rWidth, rHeight, uiMode, width, height){
@@ -109,44 +109,44 @@ class ZScreenObject{
 					let cWidth = Math.round(100*scale * width/rWidth) , cHeight = Math.round(100 * height * scale/ rHeight);
 					this.canvas.style.width = `${cWidth}%`;
 					this.canvas.style.height = `${cHeight}%`;
-					if(this.name == 'localScreen'){
+					if(this.name == 'localScreen'){			
 						if(uiMode === 1){
 							this.canvas.style.top = `${100-cHeight}%`;
 							this.canvas.style.left = `${100-cWidth}%`;
 						}else{
-							this.canvas.style.top = `${Math.floor((100 - cHeight)/2)}%`;
+							this.canvas.style.top = `${Math.floor((100 - cHeight)/2)}%`;				
 							this.canvas.style.left = `${Math.floor((100 - cWidth)/2)}%`;
-						}
+						}			
 					}else{
-						this.canvas.style.top = `${Math.floor((100 - cHeight)/2)}%`;
-					}
-				}
+						this.canvas.style.top = `${Math.floor((100 - cHeight)/2)}%`;			
+					}		
+				}						
 				this._lastResize = Date.now();
 			})
-		}
+		}		
 		if(width != this.config.width || height != this.config.height){
 			this.setSizeCanvas({width: width, height: height});
 		}
-
+		
 	}
 	drawBuff(data){
 		let buff = this.frameBuff , width = data.width, height = data.height;
 		if(width ==0 || height == 0) return;
 		let lenBuff = width * height * 4;
-		if(lenBuff <=0){
-			return;
-		}
-		let gl = this.gl;
-		let dataTypedArray = new Uint8ClampedArray(buff.slice(0, lenBuff));
+		if(lenBuff <=0){			
+			return;	
+		} 
+		let gl = this.gl;			
+		let dataTypedArray = new Uint8ClampedArray(buff.slice(0, lenBuff));		
 		let imageData = new ImageData(dataTypedArray, width, height);
-		this.resizeContainer(width, height);
+		this.resizeContainer(width, height);		
 
-		gl.putImageData(imageData, 0, 0);
+		gl.putImageData(imageData, 0, 0);	
 
 		// window.gc();
 		dataTypedArray = null;
-		imageData = null;
+		imageData = null;	
 	}
 
-}
+}	
 module.exports = ZScreenObject;

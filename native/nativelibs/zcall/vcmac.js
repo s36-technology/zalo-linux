@@ -5,11 +5,11 @@ const NO_INSTANCE_ERROR = -100;
 //======================================
 //======================================
 
-const	LOGIN_URL = "https://vlogin.zaloapp.com/login",
+const 	LOGIN_URL = "https://vlogin.zaloapp.com/login",
 		GENID_URL = "http://api.conf.talk.zing.vn/genuid",
 		CONFIG_URL = "http://api.conf.talk.zing.vn/zls?action=call_config";
 
-class VCMac{
+class VCMac{	
 	logEvent(name){
 		// console.log(new Array(5).join("="), name, new Array(5).join("="));
 	}
@@ -20,7 +20,7 @@ class VCMac{
 		// console.log(new Array(40).join("="));
 	}
 	constructor(){
-		this.onEventFire = this.onEventFire.bind(this);
+		this.onEventFire = this.onEventFire.bind(this);		
 		this.logEvent("Start Constructor");
 		this.instance = ZMacCall.MainApp();
 		this.logEvent("End Constructor");
@@ -34,7 +34,7 @@ class VCMac{
 		this.getVideoFrameLocal = this.getVideoFrameLocal.bind(this);
 		this.openRender = ()=>{this.render = false};
 		this.openRender = this.openRender.bind(this);
-	}
+	}	
 
 	///////////incoming call
 	incomingCall(data){
@@ -87,46 +87,46 @@ class VCMac{
 			let _logPath = '',
 				_osInfo = this.getOsInfo(),
 				_clientVersion = this.parseIntFallback(config.clientVersion, 0);
-			try{
+			try{				
 				let electron = require('electron');
 				let dir = electron.remote.app.getPath('userData');
 				if(config.settings.logDebug && dir){
 					let path = require('path');
-					_logPath = path.join(dir, 'call.log');
-					console.log("setconfig::logPath", _logPath);
+					_logPath = path.join(dir, 'call.log');			
+					console.log("setconfig::logPath", _logPath);		
 				}
 			}catch(e){
 				console.error(e);
 			}
-
-
+			
+			
 
 			let _servers = config.servers;
 
-			// console.log("setConfigData::set config", config);
+			// console.log("setConfigData::set config", config);		
 			if(config.changeZRTP)
 				_enableChangeZRTP = !!(config.changeZRTP.enable == 1 );
 
 			let onDone= (res)=>{
 				this.logStep("done get config state");
 					// console.log("setConfigData:::", res);
-					_config = res;
+					_config = res;									
 					this.instance.setConfig(_configJson, _userId, _partnerId, _protocol, _callId, _genSession, _config, _enableChangeZRTP, isVideoCall, _logPath, _osInfo, _clientVersion);
 					// console.log("setMediaConfig", config.audioConfig, config.extendData);
-					if(!caller){
+					if(!caller){				
 						this.instance.setMediaConfig(config.audioConfig || "", config.extendData);
 					}
 					if(_servers && caller){
 						// _servers.forEach(v=>{
-						//	this.instance.setConfigServer(v.rtcpaddr, v.rtpaddr);
-						// });
+						// 	this.instance.setConfigServer(v.rtcpaddr, v.rtpaddr);
+						// });	
 						// console.log('set servers', _servers);
 						this.instance.setListServers(JSON.stringify(_servers));
 					}else{
 						// console.log("setConfigData::setConfigData no server ??? ",config);
 						this.instance.setConfigServer(config.rtcpIP, config.rtpIP);
-					}
-
+					}			
+					
 					resolve(true);
 			};
 			if(config.zrtc_config){
@@ -135,30 +135,30 @@ class VCMac{
 			}
 			this.getConfigState()
 				.then((res)=>{
-					onDone(res);
+					onDone(res);		
 				})
 				.catch((e)=>{
 					reject(e);
 					console.error(e);
 				})
 		});
-
+		
 	}
 
 	updateCallerInfo(audioConfig, extendData){
 		this.instance.updateCallerInfo(audioConfig, extendData);
 	}
 
-	bindGetPeerId(callback){
+	bindGetPeerId(callback){		
 		this.getPeerIdCallback = callback;
 	}
 	error(args){
 		// console.log.call(this, args);
-		// console.log(args);
+		// console.log(args);		
 	}
 	log(args){
-		// console.log.call(this, args);
-		// console.log(args);
+		// console.log.call(this, args);		
+		// console.log(args);		
 	}
 
 	getCallInfo(){
@@ -172,7 +172,7 @@ class VCMac{
 	getListDevices(){
 		return this.instance.getListDevices();
 	}
-
+	
 	parseIntFallback(input, val){
 		try{
 			let x = parseInt(input);
@@ -205,7 +205,7 @@ class VCMac{
 		}
 	}
 	changeVideoDevice(id){
-		if(!id) id = '__id_default__zzzz_' + Date.now();
+		if(!id) id = '__id_default__zzzz_' + Date.now(); 
 		this.instance.changeVideoDevice(id);
 	}
 	setAgc(auto){
@@ -222,15 +222,15 @@ class VCMac{
 	}
 
 	getEventMessage(){
-		if(this.instance){
-			return this.instance.getEventMessage();
+		if(this.instance){			
+			return this.instance.getEventMessage();		
 		}else{
 			return NO_INSTANCE_ERROR;
 		}
 	}
 	getVideoFrame(buff){
 		if(this.instance){
-			let x = this.instance.getVideoFrame(buff);
+			let x = this.instance.getVideoFrame(buff);		
 			/*if(x){
 				console.log("get video frame width height", x.width, x.height);
 			}else{
@@ -242,7 +242,7 @@ class VCMac{
 
 	getVideoFrameLocal(buff){
 		if(this.instance)
-			return this.instance.getVideoFrameLocal(buff);
+			return this.instance.getVideoFrameLocal(buff);		
 	}
 	changeMinMaxMobileBitrate(){
 		this.instance.changeMinMaxMobileBitrate();
@@ -251,7 +251,7 @@ class VCMac{
 	setStartRender(a){
 		this.callStart = a;
 	}
-	onEventFire(){
+	onEventFire(){		
 		//flag start
 		//window.draw();
 		if(this.callStart) this.callStart();
@@ -278,10 +278,10 @@ class VCMac{
 
 	setState(){
 		if(!this.authenObject._session || !this.authenObject._config){
-			// console.log(new Array(5).join("="), "setState::Error::need Authentiate first", new Array(5).join("="));
+			// console.log(new Array(5).join("="), "setState::Error::need Authentiate first", new Array(5).join("="));			
 		}else{
 			this.logStep("set state");
-			if(this.getPeerIdCallback) {
+			if(this.getPeerIdCallback) {				
 				this.getPeerIdCallback(this.authenObject._genPeerId);
 			}
 			this.instance.setState(this.authenObject._session, this.authenObject._genPeerId, this.authenObject._config);
@@ -305,12 +305,12 @@ class VCMac{
 	}
 
 	//======================================
-	// Request for authenication
+	// Request for authenication	
 	//======================================
-	authenication(){
+	authenication(){		
 		this.logStep("start authenication");
 		let ans = this.authenObject;
-		return new Promise((resolve, reject)=>{
+		return new Promise((resolve, reject)=>{			
 			let doLogin = ()=>{
 				this.sendHttp(LOGIN_URL, null , false, 2000)
 					.then((res)=>{
@@ -318,14 +318,14 @@ class VCMac{
 						console.log("login success",res);
 						console.log(new Array(40).join("="));
 						let ret = JSON.parse(res);
-						if(ret.err == 0 && ret.data.err == 0){
+						if(ret.err == 0 && ret.data.err == 0){							
 							ans._session = ret.data.session;
 							doGenPeerIdState();
 						}else{
 							throw new Error(ret.err || ret.data.err);
-						}
-
-					}).catch((e)=>{
+						}						
+						
+					}).catch((e)=>{												
 						this.error(e);
 						reject(e);
 					});
@@ -352,10 +352,10 @@ class VCMac{
 			},
 			doGetConfigState = ()=>{
 				this.sendHttp(CONFIG_URL, null, false, 2000)
-					.then((res)=>{
+					.then((res)=>{			
 						// console.log(new Array(40).join("="));
 						// console.log(res);
-						// console.log(new Array(40).join("="));
+						// console.log(new Array(40).join("="));			
 						let ret = JSON.parse(res);
 						ret = ret.config;
 						// ret = JSON.stringify(ret);
@@ -368,10 +368,10 @@ class VCMac{
 						}
 						//compactObj(ret);
 						// for(let k in ret)
-						//	if(!ret[k]) {
-						//		console.log("deleted 2", k);
-						//		delete ret[k];
-						//	}
+						// 	if(!ret[k]) {
+						// 		console.log("deleted 2", k);
+						// 		delete ret[k];
+						// 	}
 						ans._config = JSON.stringify(ret);
 						// console.log(ans._config);
 						resolve(ans);
@@ -380,8 +380,8 @@ class VCMac{
 						this.error(e);
 					});
 			};
-			doLogin();
-		});
+			doLogin();	
+		});		
 	}
 
 	getConfigState(){
@@ -409,12 +409,12 @@ class VCMac{
 		return url + "?" + res.join("&");
 	}
 	sendHttp(url, query = null, post = false, timeout = null){
-		return new Promise((resolve, reject)=>{
-            let request = new XMLHttpRequest();
+		return new Promise((resolve, reject)=>{			
+            let request = new XMLHttpRequest();                             
+                      
 
-
-            if(timeout) request.timeout = timeout;
-	request.open(post ? "POST":"GET", url, true);
+            if(timeout) request.timeout = timeout;                
+           	request.open(post ? "POST":"GET", url, true);
             request.setRequestHeader('Accept', 'application/json, text/plain, */*');
             request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
 
@@ -422,21 +422,21 @@ class VCMac{
             request.onabort = (e)=>{reject(e)};
             if(timeout) request.ontimeout = (e)=>{reject(e)};
 
-            request.onreadystatechange = (res)=>{
-	// console.log("http state change ", request.readyState);
-	if (request.readyState == 4) {
-		if(request.status == 200){
-			resolve(request.responseText);
-		}else{
-			reject(request.responseText);
-		}
-			}
-            }
-
+            request.onreadystatechange = (res)=>{            	
+            	// console.log("http state change ", request.readyState);
+            	if (request.readyState == 4) {            	            		
+            		if(request.status == 200){
+            			resolve(request.responseText);	
+            		}else{
+            			reject(request.responseText);
+            		}       				
+    			}
+            }    
+                               
             request.send(query ? query : null);
-		});
+		});		
 	}
-	//======================================
+	//======================================	
 
 }
 

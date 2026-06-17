@@ -112,7 +112,8 @@ class VCLinux {
         return new Promise((resolve, reject) => {
             config = config || {};
 
-            const settingsJson = JSON.stringify(config.settings || {});
+            let zrtcConfig;
+            const settingsJson = JSON.stringify(config.settings);
             const userId = config.fromId;
             const partnerId = config.toId;
             const protocol = config.protocol;
@@ -124,9 +125,8 @@ class VCLinux {
             const osInfo = this.getOsInfo();
             const clientVersion = this.parseIntFallback(config.clientVersion, 0);
 
-            const onDone = (zrtcConfig) => {
-                // Match vcmac.js: all heavy native-shaped state is pushed into
-                // the binding. On Linux, binding.js resolves to binding-linux.js.
+            const onDone = (result) => {
+                zrtcConfig = result;
                 this.instance.setConfig(
                     settingsJson,
                     userId,
@@ -239,8 +239,6 @@ class VCLinux {
 
     changeAudioDevice(inputId, outputId) {
         try {
-            inputId = this.parseIntFallback(inputId, -10);
-            outputId = this.parseIntFallback(outputId, -10);
             this.instance.changeAudioDevice(inputId, outputId);
         } catch (error) {
             this.error(error);
@@ -273,6 +271,14 @@ class VCLinux {
         }
 
         return NO_INSTANCE_ERROR;
+    }
+
+    getProtocolMessage() {
+        if (this.instance && typeof this.instance.getProtocolMessage === 'function') {
+            return this.instance.getProtocolMessage();
+        }
+
+        return null;
     }
 
     getVideoFrame(buff) {

@@ -13,24 +13,53 @@ class LinuxMediaEngine {
         this.processes = [];
         this.relays = [];
         this.active = false;
+        this.audioInputDevice = null;
+        this.audioOutputDevice = null;
         this.videoDevice = null;
         this.desktopCapture = false;
         this.recentPorts = new Map();
     }
 
     getDeviceList() {
-        // The upstream call UI expects device arrays even if Linux currently
-        // lets GStreamer pick the default devices automatically.
+        const audioInputDevices = this.mergeAudioDevices(
+            this.getPulseAudioDevices('source') ||
+            this.getPipeWireAudioDevices('source') ||
+            this.getGstDevices('Audio/Source'),
+            this.shouldExposeSystemAudioRoutes() ? this.getAlsaRouteDevices('source') : []
+        );
+        const audioOutputDevices = this.mergeAudioDevices(
+            this.getPulseAudioDevices('sink') ||
+            this.getPipeWireAudioDevices('sink') ||
+            this.getGstDevices('Audio/Sink'),
+            this.shouldExposeSystemAudioRoutes() ? this.getAlsaRouteDevices('sink') : []
+        );
+
         return {
             autoAudioInput: true,
             autoAudioOutput: true,
-            defaultAudInputDevice: null,
-            defaultAudOutputDevice: null,
+            defaultAudInputDevice: this.audioInputDevice ||
+                this.getDefaultPulseAudioDevice('source') ||
+                this.getDefaultPipeWireAudioDevice('source'),
+            defaultAudOutputDevice: this.audioOutputDevice ||
+                this.getDefaultPulseAudioDevice('sink') ||
+                this.getDefaultPipeWireAudioDevice('sink'),
             defaultVidDevice: null,
-            audioInputDevices: this.getGstDevices('Audio/Source'),
-            audioOutputDevices: this.getGstDevices('Audio/Sink'),
+            audioInputDevices,
+            audioOutputDevices,
             videoInputDevices: this.getGstDevices('Video/Source')
         };
+    }
+
+    setAudioDevices(inputId, outputId) {
+        this.audioInputDevice = this.normalizeAudioDeviceId(inputId);
+        this.audioOutputDevice = this.normalizeAudioDeviceId(outputId);
+        if (this.shouldAllowSystemAudioRoutes()) {
+            this.applyAudioRouteSelection(this.audioInputDevice, this.audioOutputDevice);
+        }
+        this.record('mediaAudioDevicesChanged', {
+            inputId: this.audioInputDevice,
+            outputId: this.audioOutputDevice
+        });
     }
 
     startOutgoingCall(call) {
@@ -72,6 +101,7 @@ class LinuxMediaEngine {
         const debugMedia = process.env.ZALO_LINUX_CALL_DEBUG_MEDIA === '1';
         const audioLevelEnabled = process.env.ZALO_LINUX_CALL_AUDIO_LEVEL !== '0';
         const audioSource = this.buildAudioSourceArgs();
+        const audioSink = this.buildAudioSinkArgs();
         const videoConfig = this.buildVideoConfig(call);
         const videoEnabled = videoConfig.enabled && this.checkVideoRuntime().ok;
         const launchPrefix = debugMedia ? ['-m'] : ['-q'];
@@ -131,7 +161,7 @@ class LinuxMediaEngine {
             '!',
             'audioresample',
             '!',
-            'autoaudiosink',
+            ...audioSink.args,
             'sync=false'
         ];
 
@@ -204,6 +234,7 @@ class LinuxMediaEngine {
             channels,
             rtpClockRate,
             audioSource: audioSource.summary,
+            audioOutput: audioSink.summary,
             audioLevel: audioLevelEnabled,
             sendOnly: !receiveEnabled,
             receive: receiveEnabled,
@@ -606,12 +637,21 @@ class LinuxMediaEngine {
 
     buildAudioSourceArgs() {
         const preferred = String(process.env.ZALO_LINUX_CALL_AUDIO_SOURCE || '').trim().toLowerCase();
-        const input = String(process.env.ZALO_LINUX_CALL_AUDIO_INPUT || '').trim();
+        const input = this.audioInputDevice ||
+            this.normalizeAudioDeviceId(process.env.ZALO_LINUX_CALL_AUDIO_INPUT);
+        const selected = this.parseAudioDeviceSelection(input);
 
-        if (!preferred || preferred === 'auto') {
+        if (selected.backend === 'pulse' && this.hasGstElement('pulsesrc')) {
             return {
-                args: ['autoaudiosrc'],
-                summary: 'autoaudiosrc'
+                args: ['pulsesrc', 'client-name=ZaloCall Linux'].concat(selected.device ? [`device=${selected.device}`] : []),
+                summary: selected.device ? `pulsesrc:${selected.device}` : 'pulsesrc:default'
+            };
+        }
+
+        if (selected.backend === 'pipewire' && this.hasGstElement('pipewiresrc')) {
+            return {
+                args: ['pipewiresrc', 'client-name=ZaloCall Linux'].concat(selected.device ? [`target-object=${selected.device}`] : []),
+                summary: selected.device ? `pipewiresrc:${selected.device}` : 'pipewiresrc:default'
             };
         }
 
@@ -630,10 +670,17 @@ class LinuxMediaEngine {
         }
 
         if (preferred === 'pipewire' && this.hasGstElement('pipewiresrc')) {
-            const target = input || this.getDefaultPipeWireSourceTarget();
+            const target = selected.device || this.getDefaultPipeWireSourceTarget();
             return {
                 args: ['pipewiresrc', 'client-name=ZaloCall Linux'].concat(target ? [`target-object=${target}`] : []),
                 summary: target ? `pipewiresrc:${target}` : 'pipewiresrc:default'
+            };
+        }
+
+        if (!preferred || preferred === 'auto') {
+            return {
+                args: ['autoaudiosrc'],
+                summary: 'autoaudiosrc'
             };
         }
 
@@ -644,6 +691,243 @@ class LinuxMediaEngine {
             args: ['autoaudiosrc'],
             summary: 'autoaudiosrc'
         };
+    }
+
+    buildAudioSinkArgs() {
+        const preferred = String(process.env.ZALO_LINUX_CALL_AUDIO_SINK || '').trim().toLowerCase();
+        const output = this.audioOutputDevice ||
+            this.normalizeAudioDeviceId(process.env.ZALO_LINUX_CALL_AUDIO_OUTPUT);
+        const selected = this.parseAudioDeviceSelection(output);
+
+        if (selected.backend === 'pulse' && this.hasGstElement('pulsesink')) {
+            return {
+                args: ['pulsesink', 'client-name=ZaloCall Linux'].concat(selected.device ? [`device=${selected.device}`] : []),
+                summary: selected.device ? `pulsesink:${selected.device}` : 'pulsesink:default'
+            };
+        }
+
+        if (selected.backend === 'pipewire' && this.hasGstElement('pipewiresink')) {
+            return {
+                args: ['pipewiresink', 'client-name=ZaloCall Linux'].concat(selected.device ? [`target-object=${selected.device}`] : []),
+                summary: selected.device ? `pipewiresink:${selected.device}` : 'pipewiresink:default'
+            };
+        }
+
+        if (preferred === 'pulse' && this.hasGstElement('pulsesink')) {
+            return {
+                args: ['pulsesink', 'client-name=ZaloCall Linux'].concat(selected.device ? [`device=${selected.device}`] : []),
+                summary: selected.device ? `pulsesink:${selected.device}` : 'pulsesink:default'
+            };
+        }
+
+        if (preferred === 'alsa' && this.hasGstElement('alsasink')) {
+            return {
+                args: ['alsasink'].concat(selected.device ? [`device=${selected.device}`] : []),
+                summary: selected.device ? `alsasink:${selected.device}` : 'alsasink:default'
+            };
+        }
+
+        return {
+            args: ['autoaudiosink'],
+            summary: 'autoaudiosink'
+        };
+    }
+
+    normalizeAudioDeviceId(value) {
+        if (value === undefined || value === null) {
+            return null;
+        }
+
+        const device = String(value).trim();
+        if (!device || device === '-10' || device === '__default__' || device === 'default') {
+            return null;
+        }
+
+        return device;
+    }
+
+    parseAudioDeviceSelection(value) {
+        const device = this.normalizeAudioDeviceId(value);
+        if (!device) {
+            return { backend: 'auto', device: null };
+        }
+
+        const match = device.match(/^([a-z0-9_-]+):(.+)$/i);
+        if (match) {
+            return {
+                backend: match[1].toLowerCase(),
+                device: match[2]
+            };
+        }
+
+        return {
+            backend: 'auto',
+            device
+        };
+    }
+
+    shouldExposeSystemAudioRoutes() {
+        return process.env.ZALO_LINUX_CALL_SHOW_SYSTEM_AUDIO_ROUTES === '1';
+    }
+
+    shouldAllowSystemAudioRoutes() {
+        return process.env.ZALO_LINUX_CALL_ALLOW_SYSTEM_AUDIO_ROUTE === '1';
+    }
+
+    mergeAudioDevices(primary, routes) {
+        const result = [];
+        const seen = new Set();
+
+        for (const item of primary || []) {
+            const id = item && (item.id || item.i || item.device || item.name);
+            if (!id || seen.has(String(id))) continue;
+            seen.add(String(id));
+            result.push(item);
+        }
+
+        for (const item of routes || []) {
+            const id = item && item.id;
+            if (!id || seen.has(String(id))) continue;
+            seen.add(String(id));
+            result.push(item);
+        }
+
+        return result;
+    }
+
+    getAlsaRouteDevices(kind) {
+        const controls = this.getAlsaSimpleControls();
+        if (!controls.length) {
+            return [];
+        }
+
+        if (kind === 'sink') {
+            const devices = [];
+            if (controls.includes('Headphone')) {
+                devices.push({
+                    id: 'alsa-output:headphone',
+                    key: 'alsa-output:headphone',
+                    name: 'Headphone',
+                    backend: 'alsa-route'
+                });
+            }
+            if (controls.includes('Speaker')) {
+                devices.push({
+                    id: 'alsa-output:speaker',
+                    key: 'alsa-output:speaker',
+                    name: 'Speaker',
+                    backend: 'alsa-route'
+                });
+            }
+            return devices;
+        }
+
+        const captureSources = this.getAlsaCaptureSources();
+        return captureSources.map((source) => {
+            const key = source.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+            return {
+                id: `alsa-input:${key}`,
+                key: `alsa-input:${key}`,
+                name: source,
+                route: source,
+                backend: 'alsa-route'
+            };
+        });
+    }
+
+    getAlsaSimpleControls() {
+        const result = spawnSync('amixer', ['-c', '0', 'scontrols'], {
+            encoding: 'utf8',
+            timeout: 2000
+        });
+        if (result.status !== 0 || !result.stdout) {
+            return [];
+        }
+
+        const controls = [];
+        for (const line of result.stdout.split(/\r?\n/)) {
+            const match = line.match(/^Simple mixer control '([^']+)'/);
+            if (match) {
+                controls.push(match[1]);
+            }
+        }
+
+        return controls;
+    }
+
+    getAlsaCaptureSources() {
+        const result = spawnSync('amixer', ['-c', '0', 'contents'], {
+            encoding: 'utf8',
+            timeout: 3000
+        });
+        if (result.status !== 0 || !result.stdout) {
+            return [];
+        }
+
+        const match = result.stdout.match(/name='Capture Source'[\s\S]*?(?=\nnumid=|$)/);
+        if (!match) {
+            return [];
+        }
+
+        const sources = [];
+        for (const item of match[0].matchAll(/;\s*Item #\d+\s+'([^']+)'/g)) {
+            sources.push(item[1]);
+        }
+
+        return sources;
+    }
+
+    applyAudioRouteSelection(inputId, outputId) {
+        const input = this.parseAudioDeviceSelection(inputId);
+        const output = this.parseAudioDeviceSelection(outputId);
+
+        if (input.backend === 'alsa-input') {
+            this.applyAlsaInputRoute(input.device);
+        }
+
+        if (output.backend === 'alsa-output') {
+            this.applyAlsaOutputRoute(output.device);
+        }
+    }
+
+    applyAlsaInputRoute(routeKey) {
+        const sources = this.getAlsaCaptureSources();
+        const source = sources.find((item) => {
+            const key = item.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+            return key === routeKey;
+        });
+        if (!source) {
+            return;
+        }
+
+        this.spawnAlsaMixer(['-c', '0', 'cset', 'numid=6', source]);
+    }
+
+    applyAlsaOutputRoute(routeKey) {
+        if (routeKey === 'headphone') {
+            this.spawnAlsaMixer(['-c', '0', 'set', 'Headphone', 'unmute']);
+            this.spawnAlsaMixer(['-c', '0', 'set', 'Headphone', '100%']);
+            this.spawnAlsaMixer(['-c', '0', 'set', 'Speaker', 'mute']);
+            return;
+        }
+
+        if (routeKey === 'speaker') {
+            this.spawnAlsaMixer(['-c', '0', 'set', 'Speaker', 'unmute']);
+            this.spawnAlsaMixer(['-c', '0', 'set', 'Speaker', '100%']);
+            this.spawnAlsaMixer(['-c', '0', 'set', 'Headphone', 'mute']);
+        }
+    }
+
+    spawnAlsaMixer(args) {
+        const result = spawnSync('amixer', args, {
+            encoding: 'utf8',
+            timeout: 2000
+        });
+        this.record('alsaMixerRoute', {
+            args,
+            status: result.status,
+            stderr: result.stderr && result.stderr.trim() || null
+        });
     }
 
     hasGstElement(name) {
@@ -2919,6 +3203,160 @@ class LinuxMediaEngine {
         }
 
         return devices;
+    }
+
+    getPulseAudioDevices(kind) {
+        const listName = kind === 'sink' ? 'sinks' : 'sources';
+        const defaultName = this.parseAudioDeviceSelection(this.getDefaultPulseAudioDevice(kind)).device;
+        const result = spawnSync('pactl', ['-f', 'json', 'list', listName], {
+            encoding: 'utf8',
+            timeout: 3000
+        });
+        if (result.status !== 0 || !result.stdout) {
+            return this.getPulseAudioDevicesShort(kind, defaultName);
+        }
+
+        try {
+            const items = JSON.parse(result.stdout);
+            if (!Array.isArray(items)) {
+                return null;
+            }
+
+            return items
+                .filter((item) => {
+                    if (!item || !item.name) return false;
+                    if (kind === 'source') {
+                        const deviceClass = item.properties && item.properties['device.class'];
+                        return deviceClass !== 'monitor';
+                    }
+                    return true;
+                })
+                .map((item) => {
+                    const description = item.description ||
+                        item.properties && item.properties['device.description'] ||
+                        item.name;
+                    const id = `pulse:${item.name}`;
+                    return {
+                        id,
+                        key: id,
+                        device: item.name,
+                        name: description,
+                        backend: 'pulse',
+                        isDefault: item.name === defaultName
+                    };
+                });
+        } catch (_) {
+            return this.getPulseAudioDevicesShort(kind, defaultName);
+        }
+    }
+
+    getPulseAudioDevicesShort(kind, defaultName) {
+        const listName = kind === 'sink' ? 'sinks' : 'sources';
+        const result = spawnSync('pactl', ['list', 'short', listName], {
+            encoding: 'utf8',
+            timeout: 3000
+        });
+        if (result.status !== 0 || !result.stdout) {
+            return null;
+        }
+
+        const devices = [];
+        for (const line of result.stdout.split(/\r?\n/)) {
+            const parts = line.trim().split(/\s+/);
+            const name = parts[1];
+            if (!name) continue;
+            if (kind === 'source' && /\.monitor$/.test(name)) continue;
+
+            const id = `pulse:${name}`;
+            devices.push({
+                id,
+                key: id,
+                device: name,
+                name,
+                backend: 'pulse',
+                isDefault: name === defaultName
+            });
+        }
+
+        return devices;
+    }
+
+    getDefaultPulseAudioDevice(kind) {
+        const fallbackCommand = kind === 'sink' ? 'get-default-sink' : 'get-default-source';
+        const result = spawnSync('pactl', [fallbackCommand], {
+            encoding: 'utf8',
+            timeout: 1000
+        });
+        if (result.status === 0 && result.stdout.trim()) {
+            return `pulse:${result.stdout.trim()}`;
+        }
+
+        return null;
+    }
+
+    getPipeWireAudioDevices(kind) {
+        const sectionName = kind === 'sink' ? 'Sinks' : 'Sources';
+        const result = spawnSync('wpctl', ['status'], {
+            encoding: 'utf8',
+            timeout: 3000
+        });
+        if (result.status !== 0 || !result.stdout) {
+            return null;
+        }
+
+        const devices = [];
+        let inAudio = false;
+        let inTargetSection = false;
+        for (const line of result.stdout.split(/\r?\n/)) {
+            if (/^Audio$/.test(line.trim())) {
+                inAudio = true;
+                inTargetSection = false;
+                continue;
+            }
+
+            if (/^(Video|Settings)$/.test(line.trim())) {
+                inAudio = false;
+                inTargetSection = false;
+                continue;
+            }
+
+            if (!inAudio) {
+                continue;
+            }
+
+            const section = line.match(/^\s*[├└]─\s+([^:]+):/);
+            if (section) {
+                inTargetSection = section[1].trim() === sectionName;
+                continue;
+            }
+
+            if (!inTargetSection) {
+                continue;
+            }
+
+            const match = line.match(/^\s*│?\s*(\*)?\s*(\d+)\.\s+(.+?)(?:\s+\[|$)/);
+            if (!match) {
+                continue;
+            }
+
+            const id = `pipewire:${match[2]}`;
+            devices.push({
+                id,
+                key: id,
+                device: match[2],
+                name: match[3].trim(),
+                backend: 'pipewire',
+                isDefault: !!match[1]
+            });
+        }
+
+        return devices.length ? devices : null;
+    }
+
+    getDefaultPipeWireAudioDevice(kind) {
+        const devices = this.getPipeWireAudioDevices(kind) || [];
+        const item = devices.find((device) => device.isDefault);
+        return item ? item.id : null;
     }
 
     parseAddress(address) {

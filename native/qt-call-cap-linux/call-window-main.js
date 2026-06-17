@@ -60,6 +60,14 @@ ipcMain.on('answer', () => {
 ipcMain.on('hangup', () => {
     sendToParent({ type: 'hangup', source: 'button' });
 });
+ipcMain.on('change-audio-device', (_event, payload = {}) => {
+    sendToParent({
+        type: 'changeAudioDevice',
+        source: 'select',
+        inputId: payload.inputId || null,
+        outputId: payload.outputId || null
+    });
+});
 ipcMain.on('window-ready', (event) => {
     event.sender.send('call-update', callInfo);
 });

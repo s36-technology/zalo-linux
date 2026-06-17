@@ -97,8 +97,8 @@ class LinuxZCallBinding {
     }
 
     enqueueEngineEvent(message) {
-        this.enqueueProtocolEvent(message);
         this.enqueueNativeEvents();
+        this.enqueueProtocolEvent(message);
     }
 
     enqueueNativeEvent(event) {
@@ -121,6 +121,8 @@ class LinuxZCallBinding {
     }
 
     enqueueResponses(responses) {
+        this.enqueueNativeEvents();
+
         for (const response of responses || []) {
             this.enqueueProtocolEvent(response);
         }
@@ -222,7 +224,11 @@ class LinuxZCallBinding {
         this.servers = Array.isArray(servers) ? servers : [];
 
         if (this.servers[0]) {
-            this.setConfigServer(this.servers[0].rtcpaddr, this.servers[0].rtpaddr);
+            const server = this.servers[0];
+            this.setConfigServer(
+                this.getFirstValue(server.rtcpaddr, server.rtcpAddress, server.rtcpIP, server.rtcp),
+                this.getFirstValue(server.rtpaddr, server.rtpAddress, server.rtpIP, server.rtp)
+            );
         }
     }
 
@@ -318,7 +324,10 @@ class LinuxZCallBinding {
     }
 
     getEventMessage() {
-        const event = this.protocolQueue.shift() || this.eventQueue.shift();
+        // Native zcall queues JS-facing callback events here. The Linux adapter
+        // keeps protocol messages available as a fallback for the existing shim,
+        // but native events must be observed first to match vcmac/zcall_mac.
+        const event = this.eventQueue.shift() || this.protocolQueue.shift();
         return event ? JSON.stringify(event) : null;
     }
 

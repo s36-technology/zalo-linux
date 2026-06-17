@@ -78,6 +78,80 @@
       min-height: 28px;
     }
 
+    .devices {
+      width: min(100%, 312px);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 2px;
+      position: relative;
+    }
+
+    .device-button {
+      min-width: 0;
+      min-height: 42px;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      padding: 7px 9px;
+      background: #1a2029;
+      color: #f5f7fb;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    .device-button span:last-child {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .device-button:hover,
+    .device-button[aria-expanded="true"] {
+      background: #252c37;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .device-menu {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 8px);
+      z-index: 10;
+      display: grid;
+      gap: 4px;
+      max-height: 178px;
+      overflow: auto;
+      padding: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      background: #1a2029;
+      box-shadow: 0 16px 32px rgba(0, 0, 0, 0.34);
+    }
+
+    .device-menu[hidden] {
+      display: none;
+    }
+
+    .device-option {
+      min-height: 34px;
+      border-radius: 6px;
+      padding: 7px 9px;
+      background: transparent;
+      color: #f5f7fb;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    .device-option:hover,
+    .device-option.selected {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
     .pill {
       min-height: 28px;
       padding: 6px 10px;
@@ -147,6 +221,17 @@
       <h1 id="name">ZaloCall</h1>
       <p class="status" id="status">Connecting...</p>
       <div class="media" id="media"></div>
+      <div class="devices" id="devices">
+        <button class="device-button" id="mic" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <span>Mic</span>
+          <span id="micLabel">System default</span>
+        </button>
+        <button class="device-button" id="speaker" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <span>Speaker</span>
+          <span id="speakerLabel">System default</span>
+        </button>
+        <div class="device-menu" id="deviceMenu" role="listbox" hidden></div>
+      </div>
     </main>
     <div class="controls">
       <button class="answer" id="answer" title="Answer call" aria-label="Answer call" hidden>Answer</button>
@@ -159,11 +244,18 @@
     const nameEl = document.getElementById('name');
     const statusEl = document.getElementById('status');
     const mediaEl = document.getElementById('media');
+    const devicesEl = document.getElementById('devices');
+    const micButton = document.getElementById('mic');
+    const speakerButton = document.getElementById('speaker');
+    const micLabel = document.getElementById('micLabel');
+    const speakerLabel = document.getElementById('speakerLabel');
+    const deviceMenu = document.getElementById('deviceMenu');
     const answer = document.getElementById('answer');
     const hangup = document.getElementById('hangup');
     let currentCall = {};
     let timer = null;
     let ending = false;
+    let activeDeviceMenu = null;
     let hangupGuardUntil = 0;
     let hangupGuardTimer = null;
     const ANSWER_HANGUP_GUARD_MS = 5000;
@@ -189,6 +281,7 @@
       if (currentCall.media && currentCall.media.sendOnly) addPill('Mic sending');
       if (currentCall.media && currentCall.media.receive) addPill('Speaker receiving');
       if (currentCall.media && currentCall.media.remoteRtpAddress) addPill(currentCall.media.remoteRtpAddress);
+      renderDeviceSelects(currentCall);
 
       answer.hidden = !(currentCall.incoming && !currentCall.answeredAt);
       answer.disabled = false;
@@ -203,6 +296,99 @@
       pill.className = 'pill';
       pill.textContent = text;
       mediaEl.appendChild(pill);
+    }
+
+    function renderDeviceSelects(call) {
+      const devices = call.devices || {};
+      const inputs = devices.audioInputDevices || [];
+      const outputs = devices.audioOutputDevices || [];
+      devicesEl.hidden = !inputs.length && !outputs.length;
+      updateDeviceButton(micButton, micLabel, inputs, call.selectedAudioInput || devices.defaultAudInputDevice);
+      updateDeviceButton(speakerButton, speakerLabel, outputs, call.selectedAudioOutput || devices.defaultAudOutputDevice);
+      micButton.disabled = !inputs.length;
+      speakerButton.disabled = !outputs.length;
+    }
+
+    function updateDeviceButton(button, label, devices, selectedId) {
+      const selected = devices.find((device) => getDeviceId(device) === selectedId);
+      label.textContent = selected ? getDeviceName(selected) : 'System default';
+      button.dataset.value = selected ? getDeviceId(selected) : '';
+    }
+
+    function getDeviceId(device) {
+      return String(device && (device.id || device.i || device.device || device.name) || '');
+    }
+
+    function getDeviceName(device) {
+      return String(device && (device.name || device.n || device.id) || 'Audio device');
+    }
+
+    function toggleDeviceMenu(kind) {
+      if (activeDeviceMenu === kind) {
+        closeDeviceMenu();
+        return;
+      }
+
+      openDeviceMenu(kind);
+    }
+
+    function openDeviceMenu(kind) {
+      const devices = currentCall.devices || {};
+      const list = kind === 'input' ?
+        devices.audioInputDevices || [] :
+        devices.audioOutputDevices || [];
+      const selectedId = kind === 'input' ?
+        currentCall.selectedAudioInput || devices.defaultAudInputDevice || '' :
+        currentCall.selectedAudioOutput || devices.defaultAudOutputDevice || '';
+
+      deviceMenu.innerHTML = '';
+      appendDeviceOption(kind, '', 'System default', !selectedId);
+      for (const device of list) {
+        const id = getDeviceId(device);
+        appendDeviceOption(kind, id, getDeviceName(device), id === selectedId);
+      }
+
+      activeDeviceMenu = kind;
+      deviceMenu.hidden = false;
+      micButton.setAttribute('aria-expanded', kind === 'input' ? 'true' : 'false');
+      speakerButton.setAttribute('aria-expanded', kind === 'output' ? 'true' : 'false');
+    }
+
+    function appendDeviceOption(kind, id, label, selected) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = `device-option${selected ? ' selected' : ''}`;
+      option.textContent = label;
+      option.dataset.kind = kind;
+      option.dataset.id = id;
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', selected ? 'true' : 'false');
+      option.addEventListener('click', () => selectAudioDevice(kind, id));
+      deviceMenu.appendChild(option);
+    }
+
+    function selectAudioDevice(kind, id) {
+      if (kind === 'input') {
+        currentCall.selectedAudioInput = id || null;
+        currentCall.selectedAudioOutput = speakerButton.dataset.value || currentCall.selectedAudioOutput || null;
+      } else {
+        currentCall.selectedAudioOutput = id || null;
+        currentCall.selectedAudioInput = micButton.dataset.value || currentCall.selectedAudioInput || null;
+      }
+      renderDeviceSelects(currentCall);
+      closeDeviceMenu();
+      window.zaloCallWindow.changeAudioDevice(
+        currentCall.selectedAudioInput || null,
+        currentCall.selectedAudioOutput || null
+      );
+    }
+
+    function closeDeviceMenu() {
+      activeDeviceMenu = null;
+      deviceMenu.hidden = true;
+      deviceMenu.innerHTML = '';
+      micButton.setAttribute('aria-expanded', 'false');
+      speakerButton.setAttribute('aria-expanded', 'false');
     }
 
     function updateDuration() {
@@ -349,6 +535,14 @@
       guardHangupAfterAnswer();
       statusEl.textContent = 'Connecting...';
       window.zaloCallWindow.answer();
+    });
+
+    micButton.addEventListener('click', () => toggleDeviceMenu('input'));
+    speakerButton.addEventListener('click', () => toggleDeviceMenu('output'));
+    document.addEventListener('click', (event) => {
+      if (!devicesEl.contains(event.target)) {
+        closeDeviceMenu();
+      }
     });
 
     hangup.addEventListener('click', () => {

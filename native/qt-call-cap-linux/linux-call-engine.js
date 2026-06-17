@@ -78,7 +78,13 @@ class LinuxCallEngine {
                 for (const response of this.handleCallWindowUnexpectedExit(details)) {
                     if (this.send) this.send(response);
                 }
-            }
+            },
+            onChangeAudioDevice: (details) => {
+                for (const response of this.changeAudioDevice(details.inputId, details.outputId)) {
+                    if (this.send) this.send(response);
+                }
+            },
+            getDevices: () => this.getDeviceList()
         });
     }
 
@@ -123,6 +129,12 @@ class LinuxCallEngine {
 
     init(data) {
         this.localState = data || null;
+        if (this.mediaEngine && typeof this.mediaEngine.setAudioDevices === 'function') {
+            this.mediaEngine.setAudioDevices(
+                this.localState && this.localState.defaultAudInputDevice,
+                this.localState && this.localState.defaultAudOutputDevice
+            );
+        }
         return {
             type: 'update',
             command: 'callState',
@@ -382,10 +394,11 @@ class LinuxCallEngine {
 
         this.record('answerAckStatus5Pending', {
             callId: this.currentCall.callId,
-            data
+            data,
+            connectOnAck: this.shouldConnectStatusFiveOnAck()
         });
 
-        if (process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK === '1') {
+        if (this.shouldConnectStatusFiveOnAck()) {
             return this.completePendingStatusFiveAnswer('status-5-answer-ack');
         }
 
@@ -415,7 +428,18 @@ class LinuxCallEngine {
         });
 
         this.handleLocalMediaControl(data);
-        return this.completePendingStatusFiveAnswer(`status-5-${data.act}`);
+        if (process.env.ZALO_CALL_STATUS_5_CONNECT_ON_CONTROL === '1') {
+            return this.completePendingStatusFiveAnswer(`status-5-${data.act}`);
+        }
+
+        return [
+            this.buildCallState('calling', {
+                callId: this.currentCall.callId,
+                reason: 'status-5-control-pending-media',
+                stage: 'status-5-pending-connect',
+                act: data.act
+            })
+        ];
     }
 
     isStatusFiveAcceptedControl(data) {
@@ -593,12 +617,24 @@ class LinuxCallEngine {
 
         if (this.currentCall.statusFivePendingConnect) {
             const call = this.currentCall;
-            this.record('timeoutIgnoredStatus5PendingConnect', {
+            if (this.shouldIgnoreStatusFivePendingTimeout(call)) {
+                this.record('timeoutIgnoredStatus5PendingConnect', {
+                    callId,
+                    state: call.state,
+                    mediaActive: this.mediaEngine.active
+                });
+                return [];
+            }
+
+            this.record('timeoutStatus5PendingConnectNoNativeProgress', {
                 callId,
                 state: call.state,
-                mediaActive: this.mediaEngine.active
+                mediaActive: this.mediaEngine.active,
+                remoteRinging: !!call.remoteRingingAt
             });
-            return [];
+            return this.cancelStatusFiveCall(call, 5, {
+                reason: 'status-5-pending-connect-timeout'
+            });
         }
 
         this.record('timeout', {
@@ -848,9 +884,10 @@ class LinuxCallEngine {
         if (redialResponses) {
             return redialResponses;
         }
-        const answerAckSignal = this.shouldAckStatusFiveAnswer(call) ?
+        const answerAckSignal = this.shouldAckStatusFiveAnswer(call, data) ?
             this.buildAnswerAckSignal(call) :
             null;
+        call.statusFiveAckSent = !!answerAckSignal;
 
         this.record('remoteAnswerStatus5', {
             callId,
@@ -960,7 +997,7 @@ class LinuxCallEngine {
         this.statusFivePendingConnectTimer = null;
     }
 
-    shouldAckStatusFiveAnswer(call = this.currentCall) {
+    shouldAckStatusFiveAnswer(call = this.currentCall, data = null) {
         if (process.env.ZALO_CALL_STATUS_5_ACK === '1') {
             return true;
         }
@@ -969,7 +1006,30 @@ class LinuxCallEngine {
             return false;
         }
 
-        return !!(call && call.remoteRingingAt);
+        return !!(
+            call &&
+            (
+                call.remoteRingingAt ||
+                this.mediaEngine.active ||
+                this.statusFiveAnswerHasExtendMediaMode(data)
+            )
+        );
+    }
+
+    shouldConnectStatusFiveOnAck(call = this.currentCall) {
+        if (process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK === '1') {
+            return true;
+        }
+
+        if (process.env.ZALO_CALL_STATUS_5_CONNECT_ON_ACK === '0') {
+            return false;
+        }
+
+        return false;
+    }
+
+    shouldIgnoreStatusFivePendingTimeout() {
+        return process.env.ZALO_CALL_STATUS_5_TIMEOUT_CANCEL === '0';
     }
 
     shouldHoldStatusFiveForRemoteMedia() {
@@ -3332,12 +3392,18 @@ class LinuxCallEngine {
 
     buildCallState(state, extra = {}) {
         const effectiveState = this.getEffectiveCallState(state);
-        this.emitNativeCallState(effectiveState, extra);
+        if (!this.shouldSuppressNativeCallState(effectiveState, extra)) {
+            this.emitNativeCallState(effectiveState, extra);
+        }
         return {
             type: 'update',
             command: 'callState',
             data: Object.assign({ state: effectiveState }, extra)
         };
+    }
+
+    shouldSuppressNativeCallState(state, extra = {}) {
+        return state === 'calling' && extra.stage === 'incoming-request';
     }
 
     getEffectiveCallState(state) {
@@ -3388,9 +3454,39 @@ class LinuxCallEngine {
     }
 
     changeAudioDevice(inputId, outputId) {
+        if (!this.localState || typeof this.localState !== 'object') {
+            this.localState = {};
+        }
         this.localState.defaultAudInputDevice = inputId;
         this.localState.defaultAudOutputDevice = outputId;
+        if (this.mediaEngine && typeof this.mediaEngine.setAudioDevices === 'function') {
+            this.mediaEngine.setAudioDevices(inputId, outputId);
+        }
         this.record('changeAudioDevice', { inputId, outputId });
+        if (!this.currentCall) {
+            return [];
+        }
+
+        this.currentCall.selectedAudioInput = inputId || null;
+        this.currentCall.selectedAudioOutput = outputId || null;
+
+        const wasActive = this.mediaEngine && this.mediaEngine.active;
+        if (wasActive) {
+            this.currentMediaState = null;
+            this.mediaEngine.stop();
+            const responses = this.startMediaCall('audio-device-change');
+            this.callWindow.update(this.currentCall, this.currentMediaState);
+            return responses;
+        }
+
+        this.callWindow.update(this.currentCall, this.currentMediaState);
+        return [
+            this.buildCallState(this.currentCall.answeredAt ? 'connected' : 'calling', {
+                callId: this.currentCall.callId,
+                reason: 'audio-device-change',
+                media: this.currentMediaState
+            })
+        ];
     }
 
     changeVideoDevice(id) {
