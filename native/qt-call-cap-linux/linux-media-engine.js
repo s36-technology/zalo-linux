@@ -1257,6 +1257,7 @@ class LinuxMediaEngine {
             zrtcLastInitSentAt: 0,
             zrtcWrappedLocalPackets: 0,
             zrtcWrappedLocalBytes: 0,
+            zrtcShortLocalPackets: 0,
             zrtcDroppedLocalPackets: 0,
             zrtcDroppedLocalBytes: 0,
             zrtcPlainFallbackPackets: 0,
@@ -1393,8 +1394,9 @@ class LinuxMediaEngine {
             return [this.preparePlainLocalMediaPacket(relay, message)];
         }
 
-        const token = this.getRelayZrtcToken(relay);
-        if (!token) {
+        const needsToken = this.localMediaNeedsZrtcToken(relay);
+        const token = needsToken ? this.getRelayZrtcToken(relay) : 0;
+        if (needsToken && !token) {
             if (this.shouldFallbackToPlainMedia(relay)) {
                 relay.zrtcPlainFallbackPackets += 1;
                 this.noteZrtcPlainFallback(relay, message.length);
@@ -1412,6 +1414,9 @@ class LinuxMediaEngine {
         }
 
         const packet = this.buildZrtcMediaPacket(relay, message, token || 0, false);
+        if (!needsToken) {
+            relay.zrtcShortLocalPackets += 1;
+        }
         relay.zrtcWrappedLocalPackets += 1;
         relay.zrtcWrappedLocalBytes += packet.length;
 
@@ -2727,6 +2732,10 @@ class LinuxMediaEngine {
         return packet;
     }
 
+    localMediaNeedsZrtcToken(relay) {
+        return !this.shouldUseShortZrtcMediaPacket(relay);
+    }
+
     shouldUseShortZrtcMediaPacket(relay) {
         if (process.env.ZALO_LINUX_CALL_ZRTC_SHORT_MEDIA !== undefined) {
             return process.env.ZALO_LINUX_CALL_ZRTC_SHORT_MEDIA !== '0';
@@ -2889,6 +2898,7 @@ class LinuxMediaEngine {
             zrtcToken: relay.zrtcToken || undefined,
             zrtcInitAttempts: relay.zrtcInitAttempts || undefined,
             zrtcWrappedLocalPackets: relay.zrtcWrappedLocalPackets || undefined,
+            zrtcShortLocalPackets: relay.zrtcShortLocalPackets || undefined,
             zrtcDroppedLocalPackets: relay.zrtcDroppedLocalPackets || undefined,
             zrtcPlainFallbackPackets: relay.zrtcPlainFallbackPackets || undefined,
             zrtcDualLocalPackets: relay.zrtcDualLocalPackets || undefined,
