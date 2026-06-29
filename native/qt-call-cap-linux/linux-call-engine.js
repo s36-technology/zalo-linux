@@ -294,12 +294,16 @@ class LinuxCallEngine {
         }
 
         this.record('outgoingCallDeferredAfterRecentEnd', {
-            delayMs
+            delayMs,
+            deferredCallId: this.getFirstValue(data && data.callId, data && data.id, data && data.providedCallId)
         });
 
         this.pendingOutgoingCallTimer = setTimeout(() => {
             this.pendingOutgoingCallTimer = null;
             const nextRequest = Object.assign({}, data, {
+                callId: undefined,
+                id: undefined,
+                providedCallId: undefined,
                 __linuxCooldownBypass: true
             });
             for (const response of this.makeCall(nextRequest)) {
@@ -921,6 +925,11 @@ class LinuxCallEngine {
             this.callWindow.update(call, this.currentMediaState);
         }
 
+        if (this.shouldConnectStatusFiveAfterLocalAck(call, answerAckSignal)) {
+            responses.push(...this.completePendingStatusFiveAnswer('status-5-local-ack-media-active'));
+            return responses.filter(Boolean);
+        }
+
         this.scheduleStatusFivePendingConnectFallback(callId);
 
         responses.push(this.buildCallState('calling', {
@@ -1025,7 +1034,16 @@ class LinuxCallEngine {
             return false;
         }
 
-        return false;
+        return this.shouldConnectStatusFiveAfterLocalAck(call);
+    }
+
+    shouldConnectStatusFiveAfterLocalAck(call = this.currentCall, answerAckSignal = null) {
+        return !!(
+            call &&
+            !this.shouldHoldStatusFiveForRemoteMedia() &&
+            this.mediaEngine.active &&
+            (answerAckSignal || call.statusFiveAckSent)
+        );
     }
 
     shouldIgnoreStatusFivePendingTimeout() {
@@ -3423,6 +3441,11 @@ class LinuxCallEngine {
             return false;
         }
 
+        if (this.isRemoteMediaControl(data)) {
+            this.recordRemoteMediaControl(data);
+            return false;
+        }
+
         switch (data.act) {
             case 'mute_audio':
                 this.localState.audioMuted = true;
@@ -3451,6 +3474,58 @@ class LinuxCallEngine {
             default:
                 return false;
         }
+    }
+
+    isRemoteMediaControl(data) {
+        if (!data || data.act_type !== 'voip' || !this.currentCall) {
+            return false;
+        }
+
+        switch (data.act) {
+            case 'mute_audio':
+            case 'unmute_audio':
+            case 'hold_audio':
+            case 'resume_audio':
+                break;
+            default:
+                return false;
+        }
+
+        const payload = this.unwrapControlData(data);
+        const params = this.parseParams(payload.params);
+        const sender = this.getFirstValue(payload.uidFrom, params.uidFrom, payload.callerId, params.callerId);
+        const receiver = this.getFirstValue(payload.receiverId, params.receiverId, payload.uidTo, params.uidTo);
+        const localId = this.currentCall.localUserId;
+
+        if (sender && localId && String(sender) === String(localId)) {
+            return false;
+        }
+
+        if (sender || receiver || payload.params) {
+            return true;
+        }
+
+        return false;
+    }
+
+    recordRemoteMediaControl(data) {
+        const payload = this.unwrapControlData(data);
+        const params = this.parseParams(payload.params);
+        const muted = data.act === 'mute_audio';
+        const held = data.act === 'hold_audio';
+
+        this.localState.remoteAudioMuted =
+            muted ? true : (data.act === 'unmute_audio' ? false : this.localState.remoteAudioMuted);
+        this.localState.remoteAudioHeld =
+            held ? true : (data.act === 'resume_audio' ? false : this.localState.remoteAudioHeld);
+
+        this.record('remoteMediaControl', {
+            act: data.act,
+            uidFrom: this.getFirstValue(payload.uidFrom, params.uidFrom),
+            receiverId: this.getFirstValue(payload.receiverId, params.receiverId),
+            remoteAudioMuted: this.localState.remoteAudioMuted,
+            remoteAudioHeld: this.localState.remoteAudioHeld
+        });
     }
 
     changeAudioDevice(inputId, outputId) {
