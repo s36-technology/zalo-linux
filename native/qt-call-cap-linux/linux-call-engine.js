@@ -64,6 +64,11 @@ class LinuxCallEngine {
                 for (const response of this.handleRemoteMediaActivity(details)) {
                     if (this.send) this.send(response);
                 }
+            },
+            onRemoteControl: (details) => {
+                for (const response of this.handleRemoteNativeProgress(details)) {
+                    if (this.send) this.send(response);
+                }
             }
         });
         this.callWindow = new LinuxCallWindow({
@@ -902,6 +907,29 @@ class LinuxCallEngine {
         return hasExtendMediaMode;
     }
 
+    buildPreconnectPayload(data) {
+        const payload = this.unwrapControlData(data);
+        const params = this.parseParams(payload.params);
+        const merged = Object.assign({}, params || {}, payload || {});
+
+        return {
+            act: data && data.act,
+            actType: data && data.act_type,
+            callId: this.getFirstValue(
+                merged.callId,
+                merged.id,
+                this.currentCall && this.currentCall.callId
+            ),
+            status: this.toOptionalNumber(this.getFirstValue(merged.status)),
+            rtpAddress: this.getFirstValue(merged.rtpIP, merged.rtpSerIp, merged.rtpAddress),
+            rtcpAddress: this.getFirstValue(merged.rtcpIP, merged.rtcpSerIp, merged.rtcpAddress),
+            session: this.getFirstValue(merged.sessId, merged.session),
+            codec: this.getFirstValue(merged.codec, this.currentCall && this.currentCall.transportConfig && this.currentCall.transportConfig.codec),
+            extendData: this.getFirstValue(merged.extendData),
+            raw: payload
+        };
+    }
+
     handleStatusFiveRemoteAnswer(data, answerStatus) {
         if (!this.currentCall) {
             return [];
@@ -912,6 +940,15 @@ class LinuxCallEngine {
         call.state = 'remoteAnswerStatus5';
         call.statusFiveNoMedia = true;
         call.statusFivePendingConnect = true;
+        this.receiveAnswerPreconnect(
+            this.getCallControlPeerId(call),
+            callId,
+            this.buildPreconnectPayload(data),
+            {
+                source: 'remote-answer-status-5',
+                status: answerStatus
+            }
+        );
         const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
         const redialResponses = this.tryStatusFiveRedial(call, answerStatus, mediaTransportChanged, data);
         if (redialResponses) {
@@ -988,7 +1025,30 @@ class LinuxCallEngine {
             return [];
         }
 
-        return this.completePendingStatusFiveAnswer('remote-media-activity');
+        return this.completePendingStatusFiveWithAck('remote-media-activity');
+    }
+
+    handleRemoteNativeProgress(details = {}) {
+        this.record('remoteNativeProgress', {
+            callId: this.currentCall && this.currentCall.callId,
+            kind: details.kind,
+            subcmd: details.subcmd,
+            resultCode: details.resultCode,
+            remotePackets: details.remotePackets,
+            zrtcRemoteControlPackets: details.zrtcRemoteControlPackets
+        });
+
+        if (
+            !this.currentCall ||
+            !this.currentCall.statusFivePendingConnect ||
+            this.currentCall.answeredAt ||
+            details.kind !== 'zrtc-init-response' ||
+            Number(details.resultCode) !== 0
+        ) {
+            return [];
+        }
+
+        return this.completePendingStatusFiveWithAck('zrtc-init-response');
     }
 
     scheduleStatusFivePendingConnectFallback(callId) {
@@ -1044,14 +1104,7 @@ class LinuxCallEngine {
             return false;
         }
 
-        return !!(
-            call &&
-            (
-                call.remoteRingingAt ||
-                this.mediaEngine.active ||
-                this.statusFiveAnswerHasExtendMediaMode(data)
-            )
-        );
+        return false;
     }
 
     shouldConnectStatusFiveOnAck(call = this.currentCall) {
@@ -1080,7 +1133,11 @@ class LinuxCallEngine {
     }
 
     shouldHoldStatusFiveForRemoteMedia() {
-        return process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA !== '0';
+        if (process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA !== undefined) {
+            return process.env.ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA !== '0';
+        }
+
+        return true;
     }
 
     completePendingStatusFiveAnswer(reason) {
@@ -1115,8 +1172,65 @@ class LinuxCallEngine {
         ];
     }
 
+    completePendingStatusFiveWithAck(reason) {
+        const call = this.currentCall;
+        if (!call) {
+            return [];
+        }
+
+        const responses = [];
+        if (!call.statusFiveAckSent) {
+            const ackSignal = this.buildAnswerAckSignal(call);
+            call.statusFiveAckSent = true;
+            this.record('sendSignal', {
+                command: ackSignal.command,
+                data: ackSignal.data,
+                reason
+            });
+            responses.push(ackSignal);
+        }
+
+        responses.push(...this.completePendingStatusFiveAnswer(reason));
+        return responses.filter(Boolean);
+    }
+
     shouldAutoRedialStatusFive(data) {
         return process.env.ZALO_CALL_STATUS_5_AUTO_REDIAL === '1';
+    }
+
+    receiveAnswerPreconnect(peerId, callId, payload, details = {}) {
+        return this.receivePreconnect('answer', peerId, callId, payload, details);
+    }
+
+    receiveIncomingPreconnect(peerId, callId, payload, details = {}) {
+        return this.receivePreconnect('incoming', peerId, callId, payload, details);
+    }
+
+    receiveMsgPreconnect(peerId, payload, details = {}) {
+        return this.receivePreconnect('msg', peerId, this.currentCall && this.currentCall.callId, payload, details);
+    }
+
+    receivePreconnect(kind, peerId, callId, payload, details = {}) {
+        if (this.currentCall) {
+            this.currentCall.preconnect = Object.assign({}, this.currentCall.preconnect || {}, {
+                kind,
+                peerId,
+                callId,
+                payload,
+                receivedAt: Date.now()
+            });
+        }
+
+        this.record('peerJniReceivePreconnect', {
+            kind,
+            peerId,
+            callId,
+            source: details.source,
+            status: details.status,
+            payload
+        });
+
+        return [];
     }
 
     tryStatusFiveRedial(call, answerStatus, mediaTransportChanged, data) {
@@ -2182,7 +2296,9 @@ class LinuxCallEngine {
         const endToId = this.getEndSignalToId(call);
         let signals;
 
-        if (call.answeredAt && !shouldCancelStatusFiveNoMedia) {
+        const hasRemoteAnswer = !!call.answeredAt || !!call.statusFivePendingConnect;
+
+        if (hasRemoteAnswer && !shouldCancelStatusFiveNoMedia) {
             signals = [
                 {
                     type: 'sendSignal',
@@ -2194,7 +2310,7 @@ class LinuxCallEngine {
                 }
             ];
 
-            if (!call.incoming) {
+            if (!call.incoming && call.answeredAt) {
                 const cancelFallbackDelayMs = Number(
                     process.env.ZALO_CALL_CONNECTED_CANCEL_FALLBACK_MS || 0
                 );
@@ -2213,7 +2329,7 @@ class LinuxCallEngine {
                         'caller-connected-cancel-fallback'
                     );
                 }
-            } else {
+            } else if (call.incoming && call.answeredAt) {
                 const numericToId = this.getIncomingNumericPeerId(call);
                 const endFallbackDelayMs = Number(
                     process.env.ZALO_CALL_INCOMING_END_FALLBACK_MS || 700
@@ -2292,7 +2408,8 @@ class LinuxCallEngine {
             return false;
         }
 
-        return this.getRemoteMediaActivityCounter(summary) === 0;
+        return process.env.ZALO_CALL_STATUS_5_TIMEOUT_CANCEL === '1' &&
+            this.getRemoteMediaActivityCounter(summary) === 0;
     }
 
     shouldIgnoreFreshIncomingHangup(call, details) {
@@ -2419,12 +2536,10 @@ class LinuxCallEngine {
 
     getConnectedRemoteSilenceTimeoutMs() {
         const value = process.env.ZALO_CALL_CONNECTED_REMOTE_SILENCE_TIMEOUT_MS;
-        // Do not auto-end connected calls by default. Linux media support is
-        // still best-effort and some peers only send ZRTC control packets while
-        // audio/video decoding is being mapped, so a media-silence watchdog can
-        // incorrectly close a valid call window after ~15s. Developers can opt
-        // back in with ZALO_CALL_CONNECTED_REMOTE_SILENCE_TIMEOUT_MS.
-        const timeoutMs = Number(value === undefined ? 0 : value);
+        // Android native does not keep a connected call alive indefinitely when
+        // the remote side never starts/sustains RTP after preconnect. Keep a
+        // default watchdog for outgoing calls, while allowing explicit opt-out.
+        const timeoutMs = Number(value === undefined ? 15000 : value);
 
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
             return 0;
@@ -2520,6 +2635,8 @@ class LinuxCallEngine {
         this.mediaEngine.stop({ zrtcEndCall: call });
         this.callWindow.close();
         this.resetActiveCallState();
+        this.emitNativeEvent('onCallAudioState', { state: '0' });
+        this.emitNativeEvent('onCallAutoHangup');
 
         return [
             endSignal,

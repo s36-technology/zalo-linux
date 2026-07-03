@@ -182,26 +182,36 @@ Connected conditions accepted by the Linux adapter:
 
 The decompiled native files prove that visible connected state is `4`, and that
 internal/native state `5` is set after `onCallState(4)` or after incoming call
-setup. Therefore the Linux adapter must not interpret an arbitrary remote
-`status=5` value as visible connected state.
+setup. A remote web `status=5` is treated as answer-preconnect input to the
+PeerJNI compatibility layer, not as a final UI state by itself.
 
 Linux default behavior:
 
-- Do not send answer-ack (`408`) only because remote status is `5`.
-- Send answer-ack (`408`) when status `5` carries native media progress, such
-  as active media, previous remote ringing, or answer `extendData` with ZRTP/SRTP
-  media mode fields.
-- Do not emit `onCallState(4)` only because remote status is `5`.
-- Emit `onCallState(4)` after remote media packets arrive. A local `408`
-  answer-ack is necessary protocol progress but is not enough by itself because
-  some first-call `status=5` paths acknowledge without starting peer audio.
-- Do not start the UI timer only because remote status is `5`.
-- Keep the call pending until a real connected condition occurs.
+- Feed status `5` answer data through `receiveAnswerPreconnect`, matching
+  Android `PeerJNI.zrtc_peer_receive_answer_preconnect(...)`.
+- Do not send answer-ack (`408`) for status `5` by default. Android routes this
+  through native preconnect first; ACKing it early makes the receiver enter its
+  in-call timer while Linux is still pending.
+- Keep status `5` as pending preconnect after local media; do not start the
+  visible call timer from local media alone. Complete the pending preconnect,
+  send `408`, and emit `onCallState(4)` only when peer media/native progress
+  arrives, such as ZRTC init response OK or remote RTP, mirroring Android
+  `j62.b/status=0 -> zrtc_peer_set_call_state(..., 4)`.
+- Internal/native state `5` remains an established-call follow-up, not a
+  JS-visible state value.
 - Do not cancel/redial `status=5` by default. Current web/control logs show that
   sending `405` immediately after receiver accept makes the Android receiver
   end the call.
-- If status `5` still has no peer media, let the pending timeout/watchdog handle
-  cleanup unless a debug override is explicitly enabled.
+- If status `5` still has no peer media, let the pending timeout cancel it as an
+  unanswered/preconnect call unless a debug override is explicitly enabled.
+- After a connected/preconnect success, the outgoing side keeps a remote RTP
+  watchdog enabled by default. If the peer never sends real media after the
+  initial ZRTC control packet, close locally and send end-call instead of keeping
+  the UI timer alive forever.
+- If the user hangs up while `status=5` is pending, send normal end-call `409`
+  because a remote answer already exists; do not send ringing cancel `405`.
+- For `packetMode=2`, send local audio/video RTP through the short ZRTC media
+  lane (`type=4 + RTP`) on both incoming and outgoing calls.
 
 Debug-only overrides exist for protocol experiments, but they are not native
 parity defaults:

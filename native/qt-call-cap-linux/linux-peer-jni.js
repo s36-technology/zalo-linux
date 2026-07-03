@@ -66,6 +66,18 @@ class LinuxPeerJNI {
         return this.engine.handleControl(data);
     }
 
+    receiveAnswerPreconnect(peerId, callId, payload, details) {
+        return this.engine.receiveAnswerPreconnect(peerId, callId, payload, details);
+    }
+
+    receiveIncomingPreconnect(peerId, callId, payload, details) {
+        return this.engine.receiveIncomingPreconnect(peerId, callId, payload, details);
+    }
+
+    receiveMsgPreconnect(peerId, payload, details) {
+        return this.engine.receiveMsgPreconnect(peerId, payload, details);
+    }
+
     getCurrentCallId() {
         return this.engine.getCurrentCallId();
     }

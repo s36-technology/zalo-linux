@@ -110,6 +110,9 @@ Android has two important state transitions:
   session state to `4`, then calls `PeerJNI.zrtc_peer_set_call_state(..., 4)`.
 - In established-call setup, `j62.i0.h(...)` logs the confirmed call transition
   and then calls `PeerJNI.zrtc_peer_set_call_state(..., 5)`.
+- Preconnect traffic is passed to native through `v52.i0`: outgoing uses
+  `PeerJNI.zrtc_peer_receive_answer_preconnect(peer, uid, callId, json)` and
+  incoming uses `PeerJNI.zrtc_peer_receive_incoming_preconnect(...)`.
 
 `v52.r1.onInitZrtpWithServer(rtcp, rtp)` stores the selected RTCP/RTP servers and
 pushes `new j62.i(416)` into the session. `onInitZrtpRequestFailed(retCode)`
@@ -129,9 +132,10 @@ Android change-ZRTP path:
 Linux rule:
 
 - JS-visible connected is native event `onCallState(4)`.
-- Internal/native state `5` follows actual connected progress; a remote
-  `status=5` value must remain pending unless ACK/media/ZRTP progress confirms
-  the call.
+- Internal/native state `5` follows actual connected progress. A remote web
+  `status=5` answer should be handled as answer-preconnect input, then promoted
+  to `onCallState(4)` after local media and ACK make the native preconnect
+  equivalent succeed.
 - `onInitZrtpWithServer` must use native payload names: `rtcp` and `rtp`.
 - `onInitZrtpRequestFailed` must use native payload name `retCode`.
 - `418` should update the current RTP/RTCP/session, emit

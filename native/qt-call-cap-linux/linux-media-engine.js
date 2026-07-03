@@ -5,11 +5,12 @@ const crypto = require('crypto');
 const dgram = require('dgram');
 
 class LinuxMediaEngine {
-    constructor({ log, record, onRemoteEnd, onRemoteMedia }) {
+    constructor({ log, record, onRemoteEnd, onRemoteMedia, onRemoteControl }) {
         this.log = log;
         this.record = record;
         this.onRemoteEnd = typeof onRemoteEnd === 'function' ? onRemoteEnd : null;
         this.onRemoteMedia = typeof onRemoteMedia === 'function' ? onRemoteMedia : null;
+        this.onRemoteControl = typeof onRemoteControl === 'function' ? onRemoteControl : null;
         this.processes = [];
         this.relays = [];
         this.active = false;
@@ -2390,6 +2391,22 @@ class LinuxMediaEngine {
                 this.onRemoteEnd(details);
             }
         }
+
+        if (
+            this.onRemoteControl &&
+            message[0] === 2 &&
+            (subcmd === 11 || subcmd === 12) &&
+            resultCode === 0
+        ) {
+            this.onRemoteControl(Object.assign(this.getRelaySummary(relay), {
+                kind: 'zrtc-init-response',
+                subcmd,
+                resultCode,
+                token,
+                callId: callId ? String(callId) : null,
+                remoteUserId: remoteUserId ? String(remoteUserId) : null
+            }));
+        }
     }
 
     sendZrtcInitPacket(relay, reason) {
@@ -2733,13 +2750,13 @@ class LinuxMediaEngine {
         }
 
         // packetMode=2 is the short ZRTC media lane: type=4 followed by RTP.
-        // Outgoing calls were connected but silent when Linux ignored this and
-        // kept sending the token-prefixed type=3 frame. Keep incoming calls on
-        // the older long frame because that path is already known to work.
+        // Android/native applies packet mode to the media stream itself, not
+        // only to caller legs. Sending token-prefixed type=3 frames on an
+        // incoming packetMode=2 call leaves localPackets increasing while the
+        // Android peer cannot decode Linux uplink audio.
         return !!(
             relay &&
             relay.call &&
-            !relay.call.incoming &&
             Number(relay.zrtcPacketMode) === 2
         );
     }
