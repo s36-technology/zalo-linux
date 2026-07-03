@@ -192,11 +192,16 @@ Linux default behavior:
   as active media, previous remote ringing, or answer `extendData` with ZRTP/SRTP
   media mode fields.
 - Do not emit `onCallState(4)` only because remote status is `5`.
-- Emit `onCallState(4)` after the local `408` answer-ack is acknowledged or
-  after remote media packets arrive.
+- Emit `onCallState(4)` after remote media packets arrive. A local `408`
+  answer-ack is necessary protocol progress but is not enough by itself because
+  some first-call `status=5` paths acknowledge without starting peer audio.
 - Do not start the UI timer only because remote status is `5`.
 - Keep the call pending until a real connected condition occurs.
-- If pending status `5` times out with no native progress, cancel/free the call.
+- Do not cancel/redial `status=5` by default. Current web/control logs show that
+  sending `405` immediately after receiver accept makes the Android receiver
+  end the call.
+- If status `5` still has no peer media, let the pending timeout/watchdog handle
+  cleanup unless a debug override is explicitly enabled.
 
 Debug-only overrides exist for protocol experiments, but they are not native
 parity defaults:
@@ -204,6 +209,7 @@ parity defaults:
 - `ZALO_CALL_STATUS_5_ACK=1`
 - `ZALO_CALL_STATUS_5_CONNECT_ON_ACK=1`
 - `ZALO_CALL_STATUS_5_CONNECT_ON_CONTROL=1`
+- `ZALO_CALL_STATUS_5_REQUIRE_REMOTE_MEDIA=0`
 - `ZALO_CALL_STATUS_5_TIMEOUT_CANCEL=0`
 - `ZALO_CALL_STATUS_5_AUTO_REDIAL=1`
 

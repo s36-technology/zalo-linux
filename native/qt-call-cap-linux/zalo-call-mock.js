@@ -6,7 +6,7 @@ const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
-const LinuxCallEngine = require('./linux-call-engine');
+const LinuxPeerJNI = require('./linux-peer-jni');
 
 const KEY = 'yjAF9oqMWl6XfXYJn9mA7w==';
 const IV = Buffer.from('0'.repeat(32), 'hex');
@@ -26,13 +26,12 @@ const logPath = process.env.ZALO_CALL_LOG || process.env.ZALO_CALL_MOCK_LOG || p
 let recvSocket = null;
 let sendSocket = null;
 let shuttingDown = false;
-const engine = new LinuxCallEngine({
+const peer = new LinuxPeerJNI({
     log,
     send: sendToMain,
     onNativeEvent: sendToMain
 });
 let callTimeout = null;
-let latestCallConfig = {};
 
 function log(message, data) {
     const line = `[${new Date().toISOString()}] ${message}${data ? ` ${JSON.stringify(data)}` : ''}\n`;
@@ -132,7 +131,7 @@ function sendToMain(message) {
 }
 
 function handleCommand(message) {
-    // Convert renderer/native commands into LinuxCallEngine actions. The engine
+    // Convert renderer/native commands into PeerJNI-style actions. The facade
     // returns protocol messages, while this bridge handles encryption/socket IO.
     if (!message || typeof message !== 'object') {
         log('recv ignored', { reason: 'non-object-command', valueType: typeof message });
@@ -154,7 +153,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'listDevice',
-            data: engine.getDeviceList()
+            data: peer.listDevice()
         });
         return;
     }
@@ -163,7 +162,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'getCallInfo',
-            data: engine.getCallInfo()
+            data: peer.getCallInfo()
         });
         return;
     }
@@ -172,7 +171,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'isInCall',
-            data: engine.isInCall()
+            data: peer.isInCall()
         });
         return;
     }
@@ -181,14 +180,51 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'isInVideoCall',
-            data: engine.isInVideoCall()
+            data: peer.isInVideoCall()
+        });
+        return;
+    }
+
+    if (message.command === 'getJsonStats406') {
+        const data = message.data || {};
+        sendToMain({
+            type: 'response',
+            command: 'getJsonStats406',
+            data: peer.getJsonStats406(data.startNetworkType || 0, data.endNetworkType || 0)
+        });
+        return;
+    }
+
+    if (message.command === 'getExtendData') {
+        sendToMain({
+            type: 'response',
+            command: 'getExtendData',
+            data: peer.getExtendData()
+        });
+        return;
+    }
+
+    if (message.command === 'getActiveAudioCodecs') {
+        sendToMain({
+            type: 'response',
+            command: 'getActiveAudioCodecs',
+            data: peer.getActiveAudioCodecs()
+        });
+        return;
+    }
+
+    if (message.command === 'getSrtpKey') {
+        sendToMain({
+            type: 'response',
+            command: 'getSrtpKey',
+            data: peer.getSrtpKey()
         });
         return;
     }
 
     if (message.command === 'makeCall') {
         clearCallTimeout();
-        for (const response of engine.makeCall(buildMakeCallPayload(message.data))) {
+        for (const response of peer.makeCall(message.data)) {
             sendToMain(response);
         }
         scheduleCallTimeout();
@@ -197,25 +233,120 @@ function handleCommand(message) {
 
     if (message.command === 'endCall') {
         clearCallTimeout();
-        for (const response of engine.handleEndCall()) {
+        for (const response of peer.endCall()) {
             sendToMain(response);
         }
         return;
     }
 
     if (message.command === 'switchCamera') {
-        engine.switchCamera();
+        peer.switchCamera();
         return;
     }
 
     if (message.command === 'setPartnerOffCamera') {
-        engine.setPartnerOffCamera(message.data && message.data.status);
+        peer.setPartnerOffCamera(message.data && message.data.status);
+        return;
+    }
+
+    if (message.command === 'muteAudio' || message.command === 'muteCall') {
+        for (const response of peer.muteAudio(getBooleanValue(message.data, 'muted', 'mute', 'status'))) {
+            sendToMain(response);
+        }
+        return;
+    }
+
+    if (message.command === 'unmuteAudio') {
+        for (const response of peer.muteAudio(false)) {
+            sendToMain(response);
+        }
+        return;
+    }
+
+    if (message.command === 'holdAudio' || message.command === 'holdCall') {
+        for (const response of peer.holdAudio(getBooleanValue(message.data, 'held', 'hold', 'status'))) {
+            sendToMain(response);
+        }
+        return;
+    }
+
+    if (message.command === 'resumeAudio' || message.command === 'unholdAudio' || message.command === 'unholdCall') {
+        for (const response of peer.holdAudio(false)) {
+            sendToMain(response);
+        }
+        return;
+    }
+
+    if (message.command === 'setSpeakerOn') {
+        sendToMain({
+            type: 'response',
+            command: 'setSpeakerOn',
+            data: peer.setSpeakerOn(getBooleanValue(message.data, 'enabled', 'speakerOn', 'status'))
+        });
+        return;
+    }
+
+    if (message.command === 'changeVideoDevice') {
+        peer.changeVideoDevice(message.data && (message.data.id || message.data.deviceId));
+        return;
+    }
+
+    if (message.command === 'startDesktopCapture') {
+        peer.startDesktopCapture();
+        return;
+    }
+
+    if (message.command === 'stopDesktopCapture') {
+        peer.stopDesktopCapture();
+        return;
+    }
+
+    if (message.command === 'setAudioVolume') {
+        const data = message.data || {};
+        sendToMain({
+            type: 'response',
+            command: 'setAudioVolume',
+            data: peer.setAudioVolume(data.input, data.output)
+        });
+        return;
+    }
+
+    if (message.command === 'setAgc') {
+        peer.setAgc(getBooleanValue(message.data, 'auto', 'enabled', 'status'));
+        return;
+    }
+
+    if (message.command === 'changeMinMaxMobileBitrate') {
+        const data = message.data || {};
+        peer.changeMinMaxMobileBitrate(data.minBitrate, data.maxBitrate);
+        return;
+    }
+
+    if (message.command === 'setConfiguredTransport') {
+        peer.setConfiguredTransport(message.data || {});
+        return;
+    }
+
+    if (message.command === 'clearConfiguredTransport') {
+        peer.clearConfiguredTransport();
+        return;
+    }
+
+    if (message.command === 'setMediaConfig') {
+        const data = message.data || {};
+        peer.setMediaConfig(data.audioConfig || data.codec, data.extendData);
+        return;
+    }
+
+    if (message.command === 'updateCallerInfo') {
+        const data = message.data || {};
+        peer.updateCallerInfo(data.audioConfig || data.codec, data.extendData);
         return;
     }
 
     if (message.type === 'recvSignal') {
         clearCallTimeout();
-        for (const response of engine.handleRecvSignal(message.command, message.data)) {
+        for (const response of peer.receiveSignal(message.command, message.data)) {
             sendToMain(response);
         }
         scheduleCallTimeout();
@@ -223,54 +354,41 @@ function handleCommand(message) {
     }
 
     if (message.command === 'init' || message.command === 'updateLocal') {
-        latestCallConfig = Object.assign({}, latestCallConfig, message.data || {});
-        sendToMain(engine.init(message.data));
+        sendToMain(peer.init(message.data));
         return;
     }
 
     if (message.type === 'control') {
         clearCallTimeout();
-        for (const response of engine.handleControl(message.data)) {
+        for (const response of peer.receiveControl(message.data)) {
             sendToMain(response);
         }
         scheduleCallTimeout();
     }
 }
 
-function buildMakeCallPayload(data) {
-    const payload = Object.assign({}, latestCallConfig || {}, data || {});
-    const callId = getFirstValue(payload.callId, payload.id);
-
-    if (!callId || String(callId) === '0') {
-        payload.callId = generateCallId();
+function getBooleanValue(data, ...keys) {
+    if (typeof data === 'boolean') {
+        return data;
     }
 
-    log('makeCall payload prepared', {
-        callId: payload.callId,
-        type: payload.type,
-        partnerCount: Array.isArray(payload.partner) ? payload.partner.length : 0
-    });
+    if (typeof data === 'number') {
+        return data !== 0;
+    }
 
-    return payload;
-}
+    if (typeof data === 'string') {
+        return data === '1' || data.toLowerCase() === 'true';
+    }
 
-function getFirstValue(...values) {
-    for (const value of values) {
-        if (value !== undefined && value !== null && value !== '') {
-            return value;
+    if (data && typeof data === 'object') {
+        for (const key of keys) {
+            if (data[key] !== undefined) {
+                return getBooleanValue(data[key]);
+            }
         }
     }
 
-    return null;
-}
-
-function generateCallId() {
-    try {
-        const value = crypto.randomBytes(4).readUInt32BE(0);
-        return String(100000000 + (value % 900000000));
-    } catch (_) {
-        return String(100000000 + (Date.now() % 900000000));
-    }
+    return false;
 }
 
 function clearCallTimeout() {
@@ -281,7 +399,7 @@ function clearCallTimeout() {
 }
 
 function scheduleCallTimeout() {
-    const callId = engine.getCurrentCallId();
+    const callId = peer.getCurrentCallId();
     if (!callId) {
         return;
     }
@@ -290,7 +408,7 @@ function scheduleCallTimeout() {
     // state and write a missed/cancel log instead of leaving "in call" stuck.
     callTimeout = setTimeout(() => {
         callTimeout = null;
-        for (const response of engine.handleCallTimeout(callId)) {
+        for (const response of peer.handleCallTimeout(callId)) {
             sendToMain(response);
         }
     }, Number(process.env.ZALO_CALL_REQUEST_TIMEOUT_MS || 15000));
@@ -348,7 +466,7 @@ function start() {
 function shutdown(code) {
     shuttingDown = true;
     clearCallTimeout();
-    engine.shutdown();
+    peer.shutdown();
     if (recvSocket && !recvSocket.destroyed) recvSocket.destroy();
     if (sendSocket && !sendSocket.destroyed) sendSocket.destroy();
     process.exit(code);

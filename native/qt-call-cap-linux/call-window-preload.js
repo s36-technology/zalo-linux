@@ -8,7 +8,6 @@ contextBridge.exposeInMainWorld('zaloCallWindow', {
     getCallInfo: () => ipcRenderer.invoke('get-call-info'),
     answer: () => ipcRenderer.send('answer'),
     hangup: () => ipcRenderer.send('hangup'),
-    changeAudioDevice: (inputId, outputId) => ipcRenderer.send('change-audio-device', { inputId, outputId }),
     ready: () => ipcRenderer.send('window-ready'),
     onUpdate: (callback) => {
         ipcRenderer.on('call-update', (_event, callInfo) => callback(callInfo));

@@ -51,15 +51,11 @@ class LinuxMediaEngine {
     }
 
     setAudioDevices(inputId, outputId) {
-        this.audioInputDevice = this.normalizeAudioDeviceId(inputId);
-        this.audioOutputDevice = this.normalizeAudioDeviceId(outputId);
-        if (this.shouldAllowSystemAudioRoutes()) {
-            this.applyAudioRouteSelection(this.audioInputDevice, this.audioOutputDevice);
-        }
-        this.record('mediaAudioDevicesChanged', {
-            inputId: this.audioInputDevice,
-            outputId: this.audioOutputDevice
-        });
+        // Linux calls now follow the OS default input/output route. Keep this
+        // method as a compatibility no-op for older renderer/native commands.
+        this.audioInputDevice = null;
+        this.audioOutputDevice = null;
+        this.record('mediaAudioDevicesDefaultRoute', { inputId, outputId });
     }
 
     startOutgoingCall(call) {
@@ -637,43 +633,40 @@ class LinuxMediaEngine {
 
     buildAudioSourceArgs() {
         const preferred = String(process.env.ZALO_LINUX_CALL_AUDIO_SOURCE || '').trim().toLowerCase();
-        const input = this.audioInputDevice ||
-            this.normalizeAudioDeviceId(process.env.ZALO_LINUX_CALL_AUDIO_INPUT);
-        const selected = this.parseAudioDeviceSelection(input);
+        const selected = this.parseAudioDeviceSelection(null);
 
         if (selected.backend === 'pulse' && this.hasGstElement('pulsesrc')) {
             return {
-                args: ['pulsesrc', 'client-name=ZaloCall Linux'].concat(selected.device ? [`device=${selected.device}`] : []),
-                summary: selected.device ? `pulsesrc:${selected.device}` : 'pulsesrc:default'
+                args: ['pulsesrc', 'client-name=ZaloCall Linux'],
+                summary: 'pulsesrc:default'
             };
         }
 
         if (selected.backend === 'pipewire' && this.hasGstElement('pipewiresrc')) {
             return {
-                args: ['pipewiresrc', 'client-name=ZaloCall Linux'].concat(selected.device ? [`target-object=${selected.device}`] : []),
-                summary: selected.device ? `pipewiresrc:${selected.device}` : 'pipewiresrc:default'
+                args: ['pipewiresrc', 'client-name=ZaloCall Linux'],
+                summary: 'pipewiresrc:default'
             };
         }
 
         if (preferred === 'pulse' && this.hasGstElement('pulsesrc')) {
             return {
-                args: ['pulsesrc', 'client-name=ZaloCall Linux'].concat(input ? [`device=${input}`] : []),
-                summary: input ? `pulsesrc:${input}` : 'pulsesrc:default'
+                args: ['pulsesrc', 'client-name=ZaloCall Linux'],
+                summary: 'pulsesrc:default'
             };
         }
 
         if (preferred === 'alsa' && this.hasGstElement('alsasrc')) {
             return {
-                args: ['alsasrc'].concat(input ? [`device=${input}`] : []),
-                summary: input ? `alsasrc:${input}` : 'alsasrc:default'
+                args: ['alsasrc'],
+                summary: 'alsasrc:default'
             };
         }
 
         if (preferred === 'pipewire' && this.hasGstElement('pipewiresrc')) {
-            const target = selected.device || this.getDefaultPipeWireSourceTarget();
             return {
-                args: ['pipewiresrc', 'client-name=ZaloCall Linux'].concat(target ? [`target-object=${target}`] : []),
-                summary: target ? `pipewiresrc:${target}` : 'pipewiresrc:default'
+                args: ['pipewiresrc', 'client-name=ZaloCall Linux'],
+                summary: 'pipewiresrc:default'
             };
         }
 
@@ -695,35 +688,33 @@ class LinuxMediaEngine {
 
     buildAudioSinkArgs() {
         const preferred = String(process.env.ZALO_LINUX_CALL_AUDIO_SINK || '').trim().toLowerCase();
-        const output = this.audioOutputDevice ||
-            this.normalizeAudioDeviceId(process.env.ZALO_LINUX_CALL_AUDIO_OUTPUT);
-        const selected = this.parseAudioDeviceSelection(output);
+        const selected = this.parseAudioDeviceSelection(null);
 
         if (selected.backend === 'pulse' && this.hasGstElement('pulsesink')) {
             return {
-                args: ['pulsesink', 'client-name=ZaloCall Linux'].concat(selected.device ? [`device=${selected.device}`] : []),
-                summary: selected.device ? `pulsesink:${selected.device}` : 'pulsesink:default'
+                args: ['pulsesink', 'client-name=ZaloCall Linux'],
+                summary: 'pulsesink:default'
             };
         }
 
         if (selected.backend === 'pipewire' && this.hasGstElement('pipewiresink')) {
             return {
-                args: ['pipewiresink', 'client-name=ZaloCall Linux'].concat(selected.device ? [`target-object=${selected.device}`] : []),
-                summary: selected.device ? `pipewiresink:${selected.device}` : 'pipewiresink:default'
+                args: ['pipewiresink', 'client-name=ZaloCall Linux'],
+                summary: 'pipewiresink:default'
             };
         }
 
         if (preferred === 'pulse' && this.hasGstElement('pulsesink')) {
             return {
-                args: ['pulsesink', 'client-name=ZaloCall Linux'].concat(selected.device ? [`device=${selected.device}`] : []),
-                summary: selected.device ? `pulsesink:${selected.device}` : 'pulsesink:default'
+                args: ['pulsesink', 'client-name=ZaloCall Linux'],
+                summary: 'pulsesink:default'
             };
         }
 
         if (preferred === 'alsa' && this.hasGstElement('alsasink')) {
             return {
-                args: ['alsasink'].concat(selected.device ? [`device=${selected.device}`] : []),
-                summary: selected.device ? `alsasink:${selected.device}` : 'alsasink:default'
+                args: ['alsasink'],
+                summary: 'alsasink:default'
             };
         }
 

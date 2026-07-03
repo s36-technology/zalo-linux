@@ -4,14 +4,12 @@ const { spawn } = require('child_process');
 const path = require('path');
 
 class LinuxCallWindow {
-    constructor({ log, record, onAnswer, onHangup, onUnexpectedExit, onChangeAudioDevice, getDevices }) {
+    constructor({ log, record, onAnswer, onHangup, onUnexpectedExit }) {
         this.log = log;
         this.record = record;
         this.onAnswer = onAnswer;
         this.onHangup = onHangup;
         this.onUnexpectedExit = onUnexpectedExit;
-        this.onChangeAudioDevice = onChangeAudioDevice;
-        this.getDevices = getDevices;
         this.child = null;
         this.closingChildren = new WeakSet();
     }
@@ -147,18 +145,9 @@ class LinuxCallWindow {
             return;
         }
 
-        if (message.type === 'changeAudioDevice' && typeof this.onChangeAudioDevice === 'function') {
-            this.onChangeAudioDevice({
-                inputId: message.inputId,
-                outputId: message.outputId,
-                source: message.source || 'window'
-            });
-        }
     }
 
     buildCallInfo(call, mediaState) {
-        const devices = typeof this.getDevices === 'function' ? this.getDevices() : null;
-
         return {
             callId: call && call.callId,
             calleeId: call && call.calleeId,
@@ -172,14 +161,7 @@ class LinuxCallWindow {
             connecting: !!(call && call.statusFivePendingConnect && !call.answeredAt),
             ringing: !!(call && !call.incoming && !call.answeredAt && !call.statusFivePendingConnect),
             state: call && call.state,
-            media: mediaState || null,
-            devices,
-            selectedAudioInput: call && call.selectedAudioInput ||
-                devices && devices.defaultAudInputDevice ||
-                null,
-            selectedAudioOutput: call && call.selectedAudioOutput ||
-                devices && devices.defaultAudOutputDevice ||
-                null
+            media: mediaState || null
         };
     }
 
