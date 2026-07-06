@@ -235,6 +235,57 @@ function redirectLinuxCallSpawn() {
     childProcess.spawn.__zaloLinuxCallPatched = true;
 }
 
+function patchLinuxAutoLaunchIpc() {
+    if (process.platform !== 'linux' || ipcMain.handle.__zaloLinuxAutoLaunchPatched) {
+        return;
+    }
+
+    const originalHandle = ipcMain.handle.bind(ipcMain);
+
+    ipcMain.handle = (channel, listener) => {
+        if (channel !== 'check-auto-launch' && channel !== 'toggle-auto-launch') {
+            return originalHandle(channel, listener);
+        }
+
+        return originalHandle(channel, function patchedAutoLaunchHandler(...args) {
+            try {
+                return Promise.resolve(listener.apply(this, args)).catch((error) => {
+                    if (isMissingAutoLaunchApiError(error)) {
+                        traceLinuxAutoLaunchFallback(channel, error);
+                        return false;
+                    }
+
+                    throw error;
+                });
+            } catch (error) {
+                if (isMissingAutoLaunchApiError(error)) {
+                    traceLinuxAutoLaunchFallback(channel, error);
+                    return false;
+                }
+
+                throw error;
+            }
+        });
+    };
+
+    ipcMain.handle.__zaloLinuxAutoLaunchPatched = true;
+}
+
+function isMissingAutoLaunchApiError(error) {
+    return error instanceof TypeError &&
+        /Cannot read properties of undefined/.test(String(error.message || '')) &&
+        /\b(isEnabled|enable|disable)\b/.test(String(error.message || ''));
+}
+
+function traceLinuxAutoLaunchFallback(channel, error) {
+    try {
+        console.warn('[zalo-linux] auto-launch unsupported fallback', {
+            channel,
+            message: error && error.message
+        });
+    } catch (_) {}
+}
+
 function isBundledMacZaloCall(command) {
     if (typeof command !== 'string') {
         return false;
@@ -442,6 +493,7 @@ function bootstrap() {
     patchBrowserWindowForLinuxRuntime();
     traceLinuxCallIpc();
     redirectLinuxCallSpawn();
+    patchLinuxAutoLaunchIpc();
     app.once('before-quit', stopLinuxCallHelper);
 
     loadPerfRuntime();
