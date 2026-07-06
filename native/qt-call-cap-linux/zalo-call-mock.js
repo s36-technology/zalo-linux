@@ -153,7 +153,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'listDevice',
-            data: peer.listDevice()
+            data: peer.engine.getDeviceList()
         });
         return;
     }
@@ -162,7 +162,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'getCallInfo',
-            data: peer.getCallInfo()
+            data: peer.engine.getCallInfo()
         });
         return;
     }
@@ -171,7 +171,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'isInCall',
-            data: peer.isInCall()
+            data: peer.zrtc_peer_is_in_call(peer.peerHandle)
         });
         return;
     }
@@ -180,7 +180,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'isInVideoCall',
-            data: peer.isInVideoCall()
+            data: peer.zrtc_peer_is_in_video_call(peer.peerHandle)
         });
         return;
     }
@@ -190,7 +190,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'getJsonStats406',
-            data: peer.getJsonStats406(data.startNetworkType || 0, data.endNetworkType || 0)
+            data: peer.zrtc_peer_get_json_stats406(peer.peerHandle, data.startNetworkType || 0, data.endNetworkType || 0)
         });
         return;
     }
@@ -199,7 +199,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'getExtendData',
-            data: peer.getExtendData()
+            data: peer.zrtc_peer_get_extend_data(peer.peerHandle)
         });
         return;
     }
@@ -208,7 +208,7 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'getActiveAudioCodecs',
-            data: peer.getActiveAudioCodecs()
+            data: peer.zrtc_peer_get_active_audio_codecs(peer.peerHandle)
         });
         return;
     }
@@ -217,14 +217,14 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'getSrtpKey',
-            data: peer.getSrtpKey()
+            data: peer.zrtc_peer_get_srtp_key(peer.peerHandle)
         });
         return;
     }
 
     if (message.command === 'makeCall') {
         clearCallTimeout();
-        for (const response of peer.makeCall(message.data)) {
+        for (const response of peer.zrtc_peer_make_call(peer.peerHandle, message.data, message.data && message.data.listServer)) {
             sendToMain(response);
         }
         scheduleCallTimeout();
@@ -233,45 +233,45 @@ function handleCommand(message) {
 
     if (message.command === 'endCall') {
         clearCallTimeout();
-        for (const response of peer.endCall()) {
+        for (const response of peer.zrtc_peer_end_call(peer.peerHandle, false)) {
             sendToMain(response);
         }
         return;
     }
 
     if (message.command === 'switchCamera') {
-        peer.switchCamera();
+        peer.zrtc_peer_switch_camera(peer.peerHandle);
         return;
     }
 
     if (message.command === 'setPartnerOffCamera') {
-        peer.setPartnerOffCamera(message.data && message.data.status);
+        peer.zrtc_peer_set_partner_off_camera(peer.peerHandle, message.data && message.data.status);
         return;
     }
 
     if (message.command === 'muteAudio' || message.command === 'muteCall') {
-        for (const response of peer.muteAudio(getBooleanValue(message.data, 'muted', 'mute', 'status'))) {
+        for (const response of peer.zrtc_peer_mute_audio(peer.peerHandle, getBooleanValue(message.data, 'muted', 'mute', 'status'))) {
             sendToMain(response);
         }
         return;
     }
 
     if (message.command === 'unmuteAudio') {
-        for (const response of peer.muteAudio(false)) {
+        for (const response of peer.zrtc_peer_mute_audio(peer.peerHandle, false)) {
             sendToMain(response);
         }
         return;
     }
 
     if (message.command === 'holdAudio' || message.command === 'holdCall') {
-        for (const response of peer.holdAudio(getBooleanValue(message.data, 'held', 'hold', 'status'))) {
+        for (const response of peer.zrtc_peer_hold_audio(peer.peerHandle, getBooleanValue(message.data, 'held', 'hold', 'status'), true)) {
             sendToMain(response);
         }
         return;
     }
 
     if (message.command === 'resumeAudio' || message.command === 'unholdAudio' || message.command === 'unholdCall') {
-        for (const response of peer.holdAudio(false)) {
+        for (const response of peer.zrtc_peer_hold_audio(peer.peerHandle, false, true)) {
             sendToMain(response);
         }
         return;
@@ -281,23 +281,23 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'setSpeakerOn',
-            data: peer.setSpeakerOn(getBooleanValue(message.data, 'enabled', 'speakerOn', 'status'))
+            data: peer.zrtc_peer_set_speaker_on(peer.peerHandle, getBooleanValue(message.data, 'enabled', 'speakerOn', 'status'))
         });
         return;
     }
 
     if (message.command === 'changeVideoDevice') {
-        peer.changeVideoDevice(message.data && (message.data.id || message.data.deviceId));
+        peer.engine.changeVideoDevice(message.data && (message.data.id || message.data.deviceId));
         return;
     }
 
     if (message.command === 'startDesktopCapture') {
-        peer.startDesktopCapture();
+        peer.engine.startDesktopCapture();
         return;
     }
 
     if (message.command === 'stopDesktopCapture') {
-        peer.stopDesktopCapture();
+        peer.engine.stopDesktopCapture();
         return;
     }
 
@@ -306,47 +306,50 @@ function handleCommand(message) {
         sendToMain({
             type: 'response',
             command: 'setAudioVolume',
-            data: peer.setAudioVolume(data.input, data.output)
+            data: peer.engine.setAudioVolume(data.input, data.output)
         });
         return;
     }
 
     if (message.command === 'setAgc') {
-        peer.setAgc(getBooleanValue(message.data, 'auto', 'enabled', 'status'));
+        peer.engine.setAgc(getBooleanValue(message.data, 'auto', 'enabled', 'status'));
         return;
     }
 
     if (message.command === 'changeMinMaxMobileBitrate') {
         const data = message.data || {};
-        peer.changeMinMaxMobileBitrate(data.minBitrate, data.maxBitrate);
+        peer.engine.changeMinMaxMobileBitrate(data.minBitrate, data.maxBitrate);
         return;
     }
 
     if (message.command === 'setConfiguredTransport') {
-        peer.setConfiguredTransport(message.data || {});
+        peer.engine.setConfiguredTransport(message.data || {});
         return;
     }
 
     if (message.command === 'clearConfiguredTransport') {
-        peer.clearConfiguredTransport();
+        peer.engine.clearConfiguredTransport();
         return;
     }
 
     if (message.command === 'setMediaConfig') {
         const data = message.data || {};
-        peer.setMediaConfig(data.audioConfig || data.codec, data.extendData);
+        peer.engine.setMediaConfig(data.audioConfig || data.codec, data.extendData);
         return;
     }
 
     if (message.command === 'updateCallerInfo') {
         const data = message.data || {};
-        peer.updateCallerInfo(data.audioConfig || data.codec, data.extendData);
+        peer.zrtc_peer_update_caller_info(peer.peerHandle, {
+            audioPartnerCodec: data.audioConfig || data.codec,
+            extendData: data.extendData
+        });
         return;
     }
 
     if (message.type === 'recvSignal') {
         clearCallTimeout();
-        for (const response of peer.receiveSignal(message.command, message.data)) {
+        for (const response of peer.engine.handleRecvSignal(message.command, message.data)) {
             sendToMain(response);
         }
         scheduleCallTimeout();
@@ -354,13 +357,14 @@ function handleCommand(message) {
     }
 
     if (message.command === 'init' || message.command === 'updateLocal') {
-        sendToMain(peer.init(message.data));
+        peer.latestCallConfig = Object.assign({}, peer.latestCallConfig, message.data || {});
+        sendToMain(peer.engine.init(message.data));
         return;
     }
 
     if (message.type === 'control') {
         clearCallTimeout();
-        for (const response of peer.receiveControl(message.data)) {
+        for (const response of peer.engine.handleControl(message.data)) {
             sendToMain(response);
         }
         scheduleCallTimeout();
@@ -399,7 +403,7 @@ function clearCallTimeout() {
 }
 
 function scheduleCallTimeout() {
-    const callId = peer.getCurrentCallId();
+    const callId = peer.engine.getCurrentCallId();
     if (!callId) {
         return;
     }
@@ -408,7 +412,7 @@ function scheduleCallTimeout() {
     // state and write a missed/cancel log instead of leaving "in call" stuck.
     callTimeout = setTimeout(() => {
         callTimeout = null;
-        for (const response of peer.handleCallTimeout(callId)) {
+        for (const response of peer.engine.handleCallTimeout(callId)) {
             sendToMain(response);
         }
     }, Number(process.env.ZALO_CALL_REQUEST_TIMEOUT_MS || 15000));
@@ -466,7 +470,7 @@ function start() {
 function shutdown(code) {
     shuttingDown = true;
     clearCallTimeout();
-    peer.shutdown();
+    peer.engine.shutdown();
     if (recvSocket && !recvSocket.destroyed) recvSocket.destroy();
     if (sendSocket && !sendSocket.destroyed) sendSocket.destroy();
     process.exit(code);

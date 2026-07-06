@@ -204,10 +204,10 @@ Linux default behavior:
   end the call.
 - If status `5` still has no peer media, let the pending timeout cancel it as an
   unanswered/preconnect call unless a debug override is explicitly enabled.
-- After a connected/preconnect success, the outgoing side keeps a remote RTP
-  watchdog enabled by default. If the peer never sends real media after the
-  initial ZRTC control packet, close locally and send end-call instead of keeping
-  the UI timer alive forever.
+- After a connected/preconnect success, Linux does not run a remote RTP watchdog
+  by default. Android business flow leaves media quality/auto-hangup decisions
+  inside native `PeerJNI`, so the Linux watchdog is an explicit debug override
+  through `ZALO_CALL_CONNECTED_REMOTE_SILENCE_TIMEOUT_MS`.
 - If the user hangs up while `status=5` is pending, send normal end-call `409`
   because a remote answer already exists; do not send ringing cancel `405`.
 - For `packetMode=2`, send local audio/video RTP through the short ZRTC media

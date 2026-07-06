@@ -156,10 +156,11 @@ class LinuxCallWindow {
             isVideo: !!(call && (call.callType === 3 || call.callType === 6)),
             startedAt: call && call.startedAt,
             answeredAt: call && call.answeredAt,
+            androidState: call && call.androidState,
             direction: call && call.direction,
             incoming: !!(call && call.incoming),
-            connecting: !!(call && call.statusFivePendingConnect && !call.answeredAt),
-            ringing: !!(call && !call.incoming && !call.answeredAt && !call.statusFivePendingConnect),
+            connecting: !!(call && !call.answeredAt && (call.androidState === 4 || call.androidState === 5)),
+            ringing: !!(call && !call.incoming && !call.answeredAt && call.androidState !== 4 && call.androidState !== 5),
             state: call && call.state,
             media: mediaState || null
         };

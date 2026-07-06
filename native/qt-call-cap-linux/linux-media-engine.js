@@ -1211,6 +1211,10 @@ class LinuxMediaEngine {
             localRtpPayloadBytes: 0,
             localRtpSsrc: null,
             localRtpTimestamp: 0,
+            localAudioPackets: 0,
+            localAudioRtpPayloadBytes: 0,
+            localAudioRtpSsrc: null,
+            localAudioRtpTimestamp: 0,
             localRtcpPackets: 0,
             localRtcpBytes: 0,
             localRtcpTimer: null,
@@ -1374,7 +1378,7 @@ class LinuxMediaEngine {
 
     prepareLocalMediaPackets(relay, message) {
         message = this.prepareLocalRtpPacket(relay, message);
-        this.rememberLocalRtpPacket(relay, message);
+        this.rememberLocalRtpPacket(relay, message, this.getLocalRtpMediaKind(relay, message));
 
         if (!relay.zrtcMediaEnabled) {
             return [this.preparePlainLocalMediaPacket(relay, message)];
@@ -1436,7 +1440,7 @@ class LinuxMediaEngine {
         return outgoingPackets;
     }
 
-    rememberLocalRtpPacket(relay, message) {
+    rememberLocalRtpPacket(relay, message, mediaKind = 'audio') {
         if (!this.isRtpPacket(message)) {
             return;
         }
@@ -1444,6 +1448,13 @@ class LinuxMediaEngine {
         relay.localRtpSsrc = this.getRtpSsrc(message);
         relay.localRtpTimestamp = message.readUInt32BE(4);
         relay.localRtpPayloadBytes += this.getRtpPayloadByteLength(message);
+
+        if (mediaKind !== 'video') {
+            relay.localAudioPackets += 1;
+            relay.localAudioRtpSsrc = relay.localRtpSsrc;
+            relay.localAudioRtpTimestamp = relay.localRtpTimestamp;
+            relay.localAudioRtpPayloadBytes += this.getRtpPayloadByteLength(message);
+        }
 
         this.ensureLocalRtcpReporter(relay);
         this.ensureLocalZrtcControlReporter(relay);
@@ -1470,7 +1481,7 @@ class LinuxMediaEngine {
             !relay ||
             relay.closed ||
             !relay.socket ||
-            !Number.isInteger(relay.localRtpSsrc)
+            !Number.isInteger(relay.localAudioRtpSsrc)
         ) {
             return false;
         }
@@ -1493,8 +1504,8 @@ class LinuxMediaEngine {
         if (relay.localRtcpPackets === 1 || relay.localRtcpPackets % 5 === 0) {
             this.record('mediaLocalRtcpPacket', Object.assign(this.getRelaySummary(relay), {
                 bytes: packet.length,
-                ssrc: relay.localRtpSsrc,
-                rtpTimestamp: relay.localRtpTimestamp
+                ssrc: relay.localAudioRtpSsrc,
+                rtpTimestamp: relay.localAudioRtpTimestamp
             }));
         }
 
@@ -1592,12 +1603,12 @@ class LinuxMediaEngine {
         report[0] = 0x80;
         report[1] = 200;
         report.writeUInt16BE(6, 2);
-        report.writeUInt32BE(relay.localRtpSsrc >>> 0, 4);
+        report.writeUInt32BE(relay.localAudioRtpSsrc >>> 0, 4);
         report.writeUInt32BE(ntpSeconds >>> 0, 8);
         report.writeUInt32BE(ntpFraction >>> 0, 12);
-        report.writeUInt32BE(relay.localRtpTimestamp >>> 0, 16);
-        report.writeUInt32BE((relay.localPackets || 0) >>> 0, 20);
-        report.writeUInt32BE((relay.localRtpPayloadBytes || 0) >>> 0, 24);
+        report.writeUInt32BE(relay.localAudioRtpTimestamp >>> 0, 16);
+        report.writeUInt32BE((relay.localAudioPackets || 0) >>> 0, 20);
+        report.writeUInt32BE((relay.localAudioRtpPayloadBytes || 0) >>> 0, 24);
 
         return report;
     }
@@ -1643,7 +1654,7 @@ class LinuxMediaEngine {
             prepared = this.rewriteRtpPayloadType(prepared, targetPayload);
         }
 
-        if (!this.shouldRewriteLocalSsrc(relay)) {
+        if (!this.shouldRewriteLocalSsrc(relay, mediaKind)) {
             this.noteLocalPlainRtp(relay, prepared, mediaKind);
             return prepared;
         }
@@ -1666,7 +1677,11 @@ class LinuxMediaEngine {
         return prepared;
     }
 
-    shouldRewriteLocalSsrc(relay) {
+    shouldRewriteLocalSsrc(relay, mediaKind = 'audio') {
+        if (mediaKind === 'video') {
+            return false;
+        }
+
         if (process.env.ZALO_LINUX_CALL_REWRITE_LOCAL_SSRC !== undefined) {
             return process.env.ZALO_LINUX_CALL_REWRITE_LOCAL_SSRC !== '0';
         }
@@ -2534,7 +2549,7 @@ class LinuxMediaEngine {
     }
 
     shouldFallbackToPlainMedia(relay) {
-        if (process.env.ZALO_LINUX_CALL_ZRTC_PLAIN_FALLBACK === '0') {
+        if (process.env.ZALO_LINUX_CALL_ZRTC_PLAIN_FALLBACK !== '1') {
             return false;
         }
 
@@ -2557,7 +2572,7 @@ class LinuxMediaEngine {
 
     shouldSendPlainMediaOnly(relay) {
         return relay.zrtcMediaEnabled &&
-            process.env.ZALO_LINUX_CALL_ZRTC_PLAIN_ONLY !== '0' &&
+            process.env.ZALO_LINUX_CALL_ZRTC_PLAIN_ONLY === '1' &&
             relay.zrtcRemotePlainPackets > 0 &&
             relay.zrtcRemoteAudioPackets === 0;
     }
@@ -2576,7 +2591,7 @@ class LinuxMediaEngine {
     }
 
     shouldDualSendPlainMedia(relay) {
-        if (!relay.zrtcMediaEnabled || process.env.ZALO_LINUX_CALL_ZRTC_DUAL_SEND === '0') {
+        if (!relay.zrtcMediaEnabled || process.env.ZALO_LINUX_CALL_ZRTC_DUAL_SEND !== '1') {
             return false;
         }
 
@@ -2623,7 +2638,7 @@ class LinuxMediaEngine {
             return false;
         }
 
-        if (process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER === '0') {
+        if (process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER !== '1') {
             return false;
         }
 

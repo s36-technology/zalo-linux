@@ -280,7 +280,7 @@ class LinuxCallEngine {
             return 0;
         }
 
-        const cooldownMs = Math.max(0, Number(process.env.ZALO_CALL_OUTGOING_COOLDOWN_MS || 6000));
+        const cooldownMs = Math.max(0, Number(process.env.ZALO_CALL_OUTGOING_COOLDOWN_MS || 0));
         if (!cooldownMs) {
             return 0;
         }
@@ -927,6 +927,18 @@ class LinuxCallEngine {
             ];
         }
 
+        if (data.act === 'answer_ack' && this.currentCall && this.currentCall.incoming) {
+            if (this.hasMismatchedControlCallId(data)) {
+                this.record('incomingAnswerAckCallIdMismatchIgnored', {
+                    currentCallId: this.currentCall.callId,
+                    controlCallId: this.getControlCallId(data)
+                });
+                return [];
+            }
+
+            return this.establishIncomingAnswerAck(data);
+        }
+
         if (data.act === 'answer' && this.currentCall) {
             if (this.hasMismatchedControlCallId(data)) {
                 this.record('remoteAnswerCallIdMismatchIgnored', {
@@ -943,6 +955,40 @@ class LinuxCallEngine {
             this.rememberRemoteIdsFromControl(data);
 
             const answerStatus = this.getControlStatus(data);
+            if (answerStatus !== 0) {
+                const preconnectResponses = answerStatus === 5 ?
+                    this.receiveAnswerPreconnect(
+                        this.getCallControlPeerId(this.currentCall),
+                        this.currentCall.callId,
+                        data,
+                        {
+                            source: 'remote-answer-control',
+                            status: answerStatus
+                        }
+                    ) :
+                    [];
+                const provisionalAckSignal = answerStatus === 5 && process.env.ZALO_CALL_STATUS_5_ACK === '1' ?
+                    this.buildAnswerAckSignal(this.currentCall) :
+                    null;
+                this.record('remoteAnswerControlProvisional', {
+                    callId: this.currentCall.callId,
+                    status: answerStatus,
+                    androidState: this.currentCall.androidState,
+                    sentAck: !!provisionalAckSignal
+                });
+
+                return [
+                    ...preconnectResponses,
+                    provisionalAckSignal,
+                    this.buildCallState('calling', {
+                        callId: this.currentCall.callId,
+                        reason: 'remote-answer-control-provisional',
+                        status: answerStatus,
+                        androidState: this.currentCall.androidState
+                    })
+                ].filter(Boolean);
+            }
+
             const answerAction = reduceOutgoingAnswerControl(answerStatus);
             if (answerAction.type === 'answer-failed') {
                 this.record('remoteAnswerFailure', {
@@ -1013,10 +1059,11 @@ class LinuxCallEngine {
 
             return [
                 answerAckSignal,
-                this.buildCallState('calling', {
+                this.buildCallState('connected', {
                     callId: this.currentCall.callId,
                     reason: 'remote-answer',
-                    stage: 'media-running'
+                    stage: 'media-running',
+                    androidState: this.currentCall.androidState
                 })
             ];
         }
@@ -1037,6 +1084,19 @@ class LinuxCallEngine {
             zrtcRemoteVideoPackets: details.zrtcRemoteVideoPackets
         });
 
+        if (
+            this.currentCall &&
+            !this.currentCall.incoming &&
+            !this.currentCall.answeredAt &&
+            this.currentCall.androidState === AndroidCallState.WAIT_TRANSPORT &&
+            (
+                Number(details.zrtcRemoteAudioPackets || 0) > 0 ||
+                Number(details.zrtcRemoteVideoPackets || 0) > 0
+            )
+        ) {
+            return this.establishOutgoingAndroidSignal('media-connected-300');
+        }
+
         return [];
     }
 
@@ -1051,6 +1111,10 @@ class LinuxCallEngine {
         });
 
         return [];
+    }
+
+    receiveAnswerPreconnect(peerId, callId, payload, details = {}) {
+        return this.receivePreconnect('answer', peerId, callId, payload, details);
     }
 
     receiveIncomingPreconnect(peerId, callId, payload, details = {}) {
@@ -2123,7 +2187,7 @@ class LinuxCallEngine {
             return false;
         }
 
-        const guardMs = Number(process.env.ZALO_CALL_INCOMING_ANSWER_HANGUP_GUARD_MS || 5000);
+        const guardMs = Number(process.env.ZALO_CALL_INCOMING_ANSWER_HANGUP_GUARD_MS || 0);
         if (!Number.isFinite(guardMs) || guardMs <= 0) {
             return false;
         }
@@ -2238,10 +2302,10 @@ class LinuxCallEngine {
 
     getConnectedRemoteSilenceTimeoutMs() {
         const value = process.env.ZALO_CALL_CONNECTED_REMOTE_SILENCE_TIMEOUT_MS;
-        // Android native does not keep a connected call alive indefinitely when
-        // the remote side never starts/sustains RTP. Keep a default watchdog for
-        // outgoing calls, while allowing explicit opt-out.
-        const timeoutMs = Number(value === undefined ? 15000 : value);
+        // Android i0.java does not run a JS/business watchdog here; native
+        // PeerJNI owns media quality and auto-hangup decisions. Keep the Linux
+        // watchdog available only as an explicit debugging override.
+        const timeoutMs = Number(value === undefined ? 0 : value);
 
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
             return 0;
@@ -2330,7 +2394,7 @@ class LinuxCallEngine {
                     callType: call.callType
                 }
             },
-            Number(process.env.ZALO_CALL_REMOTE_MEDIA_TIMEOUT_CANCEL_FALLBACK_MS || 1200),
+            Number(process.env.ZALO_CALL_REMOTE_MEDIA_TIMEOUT_CANCEL_FALLBACK_MS || 0),
             'remote-media-timeout-cancel-fallback'
         );
 
@@ -2960,7 +3024,7 @@ class LinuxCallEngine {
             callerId: call && call.callerId,
             rtcpAddress,
             rtpAddress,
-            codec: this.selectAudioCodec(
+            codec: this.selectIncomingAudioCodec(
                 // Incoming control can expose a short top-level codec while
                 // params keeps the full offer. Prefer the full offer so Linux
                 // answers with the same payload the peer is actually sending.
@@ -3045,7 +3109,7 @@ class LinuxCallEngine {
             serverAddr: [server],
             spTcp: 0,
             srtcp: this.getFirstValue(offer.srtcp, 0),
-            srtpMode: this.getLinuxSrtpMode(),
+            srtpMode: this.getFirstValue(mediaMode.srtpMode, offer.srtpMode, this.getLinuxSrtpMode()),
             supportCallBusy: this.getFirstValue(offer.supportCallBusy, 1),
             supportHevcDecode: this.getLinuxHevcDecodeSupport(),
             tpType: this.getFirstValue(offer.tpType, server.tpType || 0),
@@ -3490,10 +3554,15 @@ class LinuxCallEngine {
         if (!this.shouldSuppressNativeCallState(effectiveState, extra)) {
             this.emitNativeCallState(effectiveState, extra);
         }
+        const call = this.currentCall;
         return {
             type: 'update',
             command: 'callState',
-            data: Object.assign({ state: effectiveState }, extra)
+            data: Object.assign({
+                state: effectiveState,
+                answeredAt: call && call.answeredAt || null,
+                androidState: call && call.androidState
+            }, extra)
         };
     }
 
@@ -4051,15 +4120,13 @@ class LinuxCallEngine {
 
         if (
             (this.currentCall && this.currentCall.answeredAt) ||
-            state === 'connected' ||
-            extra.stage === 'media-running' ||
-            (extra.stage === 'media-started' && extra.connected === true) ||
-            extra.stage === 'remote-answer' ||
-            extra.stage === 'incoming-answer' ||
-            extra.stage === 'request-accepted'
+            (this.currentCall && this.currentCall.androidState === AndroidCallState.CONFIRMED) ||
+            state === 'connected'
         ) {
-            // Native zcall emits state 4 for connected and immediately moves
-            // the peer state to 5 from that callback.
+            // Android i0.h() is the only point that moves f76519b to 7 and
+            // PeerJNI state to 5. Linux exposes native connected only after the
+            // equivalent confirmed state, so the UI timer cannot start during
+            // ringing, 416/progress, or media pre-start.
             return 4;
         }
 
@@ -4182,6 +4249,23 @@ class LinuxCallEngine {
             name: 'opus/16000/1',
             dynamicFptime: 0
         }]);
+    }
+
+    selectIncomingAudioCodec(...values) {
+        for (const value of values) {
+            const offered = this.parseCodecList(value);
+            const selected = offered
+                .filter((codec) => codec && typeof codec === 'object')
+                .map((codec) => Object.assign({}, codec, {
+                    payload: Number(codec.payload)
+                }))
+                .find((codec) => Number.isInteger(codec.payload) && /opus\//i.test(String(codec.name || '')));
+            if (selected) {
+                return JSON.stringify([selected]);
+            }
+        }
+
+        return this.selectAudioCodec(...values);
     }
 
     pickPreferredAudioCodec(codecs) {
