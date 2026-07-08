@@ -152,6 +152,8 @@ class LinuxCallWindow {
             callId: call && call.callId,
             calleeId: call && call.calleeId,
             calleeName: call && call.calleeName,
+            calleeAvatar: call && call.calleeAvatar,
+            displayName: this.getDisplayName(call),
             callType: call && call.callType,
             isVideo: !!(call && (call.callType === 3 || call.callType === 6)),
             startedAt: call && call.startedAt,
@@ -164,6 +166,20 @@ class LinuxCallWindow {
             state: call && call.state,
             media: mediaState || null
         };
+    }
+
+    getDisplayName(call) {
+        const name = call && (
+            call.calleeName ||
+            call.callerName ||
+            call.partnerName ||
+            call.displayName
+        );
+        if (name && String(name).trim()) {
+            return String(name).trim();
+        }
+
+        return call && call.incoming ? 'Incoming Zalo call' : 'Zalo call';
     }
 
     resolveElectronPath() {

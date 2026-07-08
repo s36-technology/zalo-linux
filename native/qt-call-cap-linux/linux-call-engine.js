@@ -55,7 +55,10 @@ class LinuxCallEngine {
         this.localState = {};
         this.lastOutgoingCallId = null;
         this.lastCallEndedAt = 0;
+        this.lastVoipResetTimeMs = 5000;
+        this.lastCheckTimeoutMs = 2000;
         this.pendingOutgoingCallTimer = null;
+        this.delayedSignalTimers = new Set();
         this.connectedRemoteSilenceTimer = null;
         this.experimental = process.env.ZALO_LINUX_CALL_EXPERIMENTAL === '1';
         this.mediaEngineEnabled = process.env.ZALO_LINUX_CALL_MEDIA_ENGINE !== '0';
@@ -183,6 +186,8 @@ class LinuxCallEngine {
             return this.deferOutgoingCall(data, cooldownDelayMs);
         }
 
+        this.prepareAndroidSessionForNewOutgoingCall(data);
+
         if (this.currentCall || this.callRunning) {
             return [
                 this.buildCallState('calling', {
@@ -212,6 +217,7 @@ class LinuxCallEngine {
             localUserId: data.fromId || data.userId || null,
             zrtcToken: 0,
             calleeName: partner.name,
+            calleeAvatar: partner.avatar || partner.photo || partner.picture || '',
             callType,
             protocol: data.protocol,
             session: data.sessId || data.session,
@@ -220,6 +226,7 @@ class LinuxCallEngine {
             loggedBubble: false,
             requestData: data,
             state: 'requesting',
+            nativeMakeCallApplied: false,
             androidState: AndroidCallState.READY_REQUEST
         };
         if (this.localState.configuredTransport) {
@@ -280,7 +287,12 @@ class LinuxCallEngine {
             return 0;
         }
 
-        const cooldownMs = Math.max(0, Number(process.env.ZALO_CALL_OUTGOING_COOLDOWN_MS || 0));
+        const envCooldown = process.env.ZALO_CALL_OUTGOING_COOLDOWN_MS;
+        const cooldownMs = Math.max(0, Number(
+            envCooldown !== undefined ?
+                envCooldown :
+                this.lastVoipResetTimeMs || 5000
+        ));
         if (!cooldownMs) {
             return 0;
         }
@@ -409,6 +421,7 @@ class LinuxCallEngine {
                 return this.handleIncomingAnswerResponseSignal(data);
             case 'request-call-response':
                 this.currentCall.state = 'requestCallResponse';
+                this.rememberVoipResetTime(data);
                 this.setAndroidCallState(action.nextState, 'request-call-response-401');
                 // The 401 response contains server RTP/RTCP/session info. We map it
                 // into the 416 sendRequestCall payload below.
@@ -559,6 +572,7 @@ class LinuxCallEngine {
         call.state = 'incomingAnswerAccepted';
         call.incomingAnswerAckPending = true;
         this.setAndroidCallState(action.nextState, 'incoming-answer-response');
+        this.applyPeerJniCallState(4, 'incoming-answer-response');
 
         return [
             this.buildCallState('calling', {
@@ -606,6 +620,9 @@ class LinuxCallEngine {
 
         call.incomingAnswerAckPending = false;
         call.state = 'confirmed';
+        if (!this.applyPeerJniCallState(5, 'incoming-answer-ack-408')) {
+            return [];
+        }
         call.answeredAt = call.answeredAt || Date.now();
         this.setAndroidCallState(AndroidCallState.CONFIRMED, 'incoming-answer-ack-408');
         this.record('incomingAnswerConfirmed', {
@@ -638,7 +655,13 @@ class LinuxCallEngine {
             return [];
         }
 
+        const answerAckSignal = this.buildAnswerAckSignal(call);
         call.state = 'remoteAnswer';
+        if (!this.applyPeerJniCallState(5, reason)) {
+            return [];
+        }
+        this.clearStatusFivePreconnectTimer(reason);
+        delete call.pendingStatusFivePreconnect;
         call.answeredAt = call.answeredAt || Date.now();
         this.setAndroidCallState(AndroidCallState.CONFIRMED, reason);
         this.emitNativeCallState('connected', {
@@ -647,17 +670,24 @@ class LinuxCallEngine {
         });
 
         if (!this.mediaEngineEnabled) {
-            return this.stopUnsupportedMediaCall(`${reason}-without-media-engine`);
+            return [
+                answerAckSignal,
+                ...this.stopUnsupportedMediaCall(`${reason}-without-media-engine`)
+            ].filter(Boolean);
         }
 
         if (!this.mediaEngine.active) {
-            return this.startMediaCall(reason);
+            return [
+                answerAckSignal,
+                ...this.startMediaCall(reason)
+            ].filter(Boolean);
         }
 
         this.callWindow.update(call, this.currentMediaState);
         this.scheduleConnectedRemoteSilenceWatchdog(reason);
 
         return [
+            answerAckSignal,
             this.buildCallState('connected', {
                 callId: call.callId,
                 reason,
@@ -828,7 +858,13 @@ class LinuxCallEngine {
             return [];
         }
 
-        if (this.currentCall.answeredAt) {
+        if (this.currentCall.answeredAt || this.isPastRequestTimeoutStage(this.currentCall)) {
+            this.record('timeoutIgnoredAfterMediaStart', {
+                callId,
+                state: this.currentCall.state,
+                hasMediaState: !!this.currentMediaState,
+                mediaActive: !!(this.mediaEngine && this.mediaEngine.active)
+            });
             return [];
         }
 
@@ -873,11 +909,27 @@ class LinuxCallEngine {
     }
 
     getCurrentCallId() {
-        if (!this.currentCall || this.currentCall.answeredAt) {
+        if (!this.currentCall || this.currentCall.answeredAt || this.isPastRequestTimeoutStage(this.currentCall)) {
             return null;
         }
 
         return this.currentCall.callId;
+    }
+
+    isPastRequestTimeoutStage(call) {
+        return !!(
+            call &&
+            (
+                call.state === 'mediaStarted' ||
+                call.state === 'remoteAnswer' ||
+                call.state === 'confirmed' ||
+                call.state === 'incomingAnswerSent' ||
+                call.incomingAnswerAckPending ||
+                call.pendingStatusFivePreconnect ||
+                this.currentMediaState ||
+                this.mediaEngine && this.mediaEngine.active
+            )
+        );
     }
 
     handleCallWindowUnexpectedExit(details) {
@@ -956,8 +1008,16 @@ class LinuxCallEngine {
 
             const answerStatus = this.getControlStatus(data);
             if (answerStatus !== 0) {
-                const preconnectResponses = answerStatus === 5 ?
-                    this.receiveAnswerPreconnect(
+                const isTransportPreconnect = answerStatus === 5 && this.hasAnswerPreconnectTransport(data);
+                if (isTransportPreconnect) {
+                    const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
+                    this.currentCall.pendingStatusFivePreconnect = {
+                        at: Date.now(),
+                        mediaTransportChanged,
+                        rtpAddress: this.currentCall.transportConfig && this.currentCall.transportConfig.rtpAddress,
+                        session: this.currentCall.transportConfig && this.currentCall.transportConfig.session
+                    };
+                    const preconnectResponses = this.applyPeerJniAnswerPreconnect(
                         this.getCallControlPeerId(this.currentCall),
                         this.currentCall.callId,
                         data,
@@ -965,21 +1025,47 @@ class LinuxCallEngine {
                             source: 'remote-answer-control',
                             status: answerStatus
                         }
-                    ) :
-                    [];
-                const provisionalAckSignal = answerStatus === 5 && process.env.ZALO_CALL_STATUS_5_ACK === '1' ?
-                    this.buildAnswerAckSignal(this.currentCall) :
-                    null;
-                this.record('remoteAnswerControlProvisional', {
-                    callId: this.currentCall.callId,
-                    status: answerStatus,
-                    androidState: this.currentCall.androidState,
-                    sentAck: !!provisionalAckSignal
-                });
+                    );
+                    this.record('remoteAnswerTransportPreconnect', {
+                        callId: this.currentCall.callId,
+                        status: answerStatus,
+                        androidState: this.currentCall.androidState,
+                        mediaTransportChanged,
+                        rtpAddress: this.currentCall.transportConfig && this.currentCall.transportConfig.rtpAddress,
+                        session: this.currentCall.transportConfig && this.currentCall.transportConfig.session
+                    });
+
+                    return [
+                        ...preconnectResponses,
+                        this.buildCallState('calling', {
+                            callId: this.currentCall.callId,
+                            reason: 'remote-answer-transport-preconnect',
+                            status: answerStatus,
+                            androidState: this.currentCall.androidState,
+                            mediaTransportChanged
+                        })
+                    ].filter(Boolean);
+                }
+
+                const answerAction = reduceOutgoingAnswerControl(answerStatus);
+                if (answerAction.type === 'answer-failed') {
+                    this.record('remoteAnswerFailure', {
+                        callId: this.currentCall.callId,
+                        status: answerStatus,
+                        reason: 'non-zero-answer-status',
+                        hasPreconnectTransport: this.hasAnswerPreconnectTransport(data)
+                    });
+                    return this.handleRemoteEndControl({
+                        act_type: 'voip',
+                        act: 'answer_failed',
+                        data: {
+                            callId: this.currentCall.callId,
+                            status: answerStatus
+                        }
+                    });
+                }
 
                 return [
-                    ...preconnectResponses,
-                    provisionalAckSignal,
                     this.buildCallState('calling', {
                         callId: this.currentCall.callId,
                         reason: 'remote-answer-control-provisional',
@@ -1021,51 +1107,7 @@ class LinuxCallEngine {
                 ];
             }
 
-            // Remote answer marks the call as connected. From this point local
-            // hangup should send 409 endcall instead of 405 cancel.
-            const answerAckSignal = this.buildAnswerAckSignal(this.currentCall);
-            this.currentCall.state = 'remoteAnswer';
-            this.currentCall.answeredAt = Date.now();
-            this.setAndroidCallState(AndroidCallState.CONFIRMED, 'remote-answer');
-            this.emitNativeCallState('connected', {
-                callId: this.currentCall.callId,
-                stage: 'remote-answer'
-            });
-            const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
-
-            if (!this.mediaEngineEnabled) {
-                return [
-                    answerAckSignal,
-                    ...this.stopUnsupportedMediaCall('remote-answer-without-media-engine')
-                ].filter(Boolean);
-            }
-
-            if (mediaTransportChanged && this.mediaEngine.active) {
-                this.currentMediaState = null;
-                this.mediaEngine.stop();
-            }
-
-            if (!this.mediaEngine.active) {
-                return [
-                    answerAckSignal,
-                    ...this.startMediaCall(
-                        mediaTransportChanged ? 'remote-answer-transport-update' : 'remote-answer'
-                    )
-                ].filter(Boolean);
-            }
-
-            this.callWindow.update(this.currentCall, this.currentMediaState);
-            this.scheduleConnectedRemoteSilenceWatchdog('remote-answer-media-running');
-
-            return [
-                answerAckSignal,
-                this.buildCallState('connected', {
-                    callId: this.currentCall.callId,
-                    reason: 'remote-answer',
-                    stage: 'media-running',
-                    androidState: this.currentCall.androidState
-                })
-            ];
+            return this.establishOutgoingRemoteAnswerFromControl(data, 'remote-answer');
         }
 
         if (this.isRemoteHangupControl(data)) {
@@ -1094,6 +1136,7 @@ class LinuxCallEngine {
                 Number(details.zrtcRemoteVideoPackets || 0) > 0
             )
         ) {
+            this.clearStatusFivePreconnectTimer('media-connected-300');
             return this.establishOutgoingAndroidSignal('media-connected-300');
         }
 
@@ -1110,19 +1153,186 @@ class LinuxCallEngine {
             zrtcRemoteControlPackets: details.zrtcRemoteControlPackets
         });
 
+        if (
+            this.currentCall &&
+            !this.currentCall.incoming &&
+            !this.currentCall.answeredAt &&
+            this.currentCall.androidState === AndroidCallState.WAIT_TRANSPORT &&
+            this.currentCall.pendingStatusFivePreconnect &&
+            details.kind === 'zrtc-init-response' &&
+            Number(details.resultCode) === 0
+        ) {
+            this.record('remoteNativeProgressPromotedToMediaConnected', {
+                callId: this.currentCall.callId,
+                kind: details.kind,
+                subcmd: details.subcmd,
+                resultCode: details.resultCode,
+                statusFiveAt: this.currentCall.pendingStatusFivePreconnect.at
+            });
+            return this.establishOutgoingAndroidSignal('native-zrtc-connected-300');
+        }
+
         return [];
     }
 
     receiveAnswerPreconnect(peerId, callId, payload, details = {}) {
+        if (!details._fromPeerJni && this.peerJni && typeof this.peerJni.zrtc_peer_receive_answer_preconnect === 'function') {
+            return this.peerJni.zrtc_peer_receive_answer_preconnect(
+                this.getPeerJniHandle(),
+                peerId,
+                callId,
+                payload
+            );
+        }
+
         return this.receivePreconnect('answer', peerId, callId, payload, details);
     }
 
     receiveIncomingPreconnect(peerId, callId, payload, details = {}) {
+        if (!details._fromPeerJni && this.peerJni && typeof this.peerJni.zrtc_peer_receive_incoming_preconnect === 'function') {
+            return this.peerJni.zrtc_peer_receive_incoming_preconnect(
+                this.getPeerJniHandle(),
+                peerId,
+                callId,
+                payload
+            );
+        }
+
         return this.receivePreconnect('incoming', peerId, callId, payload, details);
     }
 
     receiveMsgPreconnect(peerId, payload, details = {}) {
+        if (!details._fromPeerJni && this.peerJni && typeof this.peerJni.zrtc_peer_receive_msg_preconnect === 'function') {
+            return this.peerJni.zrtc_peer_receive_msg_preconnect(
+                this.getPeerJniHandle(),
+                peerId,
+                payload
+            );
+        }
+
         return this.receivePreconnect('msg', peerId, this.currentCall && this.currentCall.callId, payload, details);
+    }
+
+    applyPeerJniAnswerPreconnect(peerId, callId, payload, details = {}) {
+        if (this.peerJni && typeof this.peerJni.zrtc_peer_receive_answer_preconnect === 'function') {
+            return this.peerJni.zrtc_peer_receive_answer_preconnect(
+                this.getPeerJniHandle(),
+                peerId,
+                callId,
+                payload,
+                details
+            );
+        }
+
+        return this.receiveAnswerPreconnect(peerId, callId, payload, details);
+    }
+
+    applyPeerJniCallState(state, reason) {
+        if (!this.peerJni || typeof this.peerJni.zrtc_peer_set_call_state !== 'function') {
+            this.record('peerJniCallStateMissing', { state, reason });
+            return false;
+        }
+
+        this.peerJni.zrtc_peer_set_call_state(this.getPeerJniHandle(), state);
+        this.record('peerJniCallStateApplied', { state, reason });
+        return true;
+    }
+
+    applyPeerJniUpdateCallerInfoFromControl(data) {
+        if (!this.peerJni || typeof this.peerJni.zrtc_media_codec_info_create !== 'function') {
+            return false;
+        }
+
+        const payload = this.unwrapControlData(data);
+        const params = this.parseParams(payload.params);
+        const codec = this.getFirstValue(payload.codec, params.codec);
+        const extendData = this.getFirstValue(payload.extendData, payload.extend_data, params.extendData, params.extend_data, '');
+        const mediaCodecInfo = this.peerJni.zrtc_media_codec_info_create();
+        this.peerJni.zrtc_media_codec_info_set_audio_partner_codec(mediaCodecInfo, codec || '');
+        this.peerJni.zrtc_media_codec_info_set_extend_data(mediaCodecInfo, extendData || '');
+        const ok = this.peerJni.zrtc_peer_update_caller_info(
+            this.getPeerJniHandle(),
+            mediaCodecInfo,
+            ''
+        );
+        this.peerJni.zrtc_media_codec_info_delete(mediaCodecInfo);
+        this.record('peerJniUpdateCallerInfoApplied', {
+            ok: !!ok,
+            hasCodec: !!codec,
+            hasExtendData: !!extendData
+        });
+        return !!ok;
+    }
+
+    establishOutgoingRemoteAnswerFromControl(data, reason) {
+        const answerAckSignal = this.buildAnswerAckSignal(this.currentCall);
+        const mediaTransportChanged = this.updateCurrentTransportFromControl(data);
+        const updateCallerInfoOk = this.applyPeerJniUpdateCallerInfoFromControl(data);
+        if (!updateCallerInfoOk) {
+            this.record('remoteAnswerCodecNegotiationFailed', {
+                callId: this.currentCall.callId,
+                reason
+            });
+            return this.handleRemoteEndControl({
+                act_type: 'voip',
+                act: 'answer_failed',
+                data: {
+                    callId: this.currentCall.callId,
+                    status: this.getControlStatus(data)
+                }
+            });
+        }
+
+        // Android i0.y() reaches h(true) only after native caller-info update.
+        // Keep the same interface order before moving to confirmed state.
+        this.currentCall.state = 'remoteAnswer';
+        if (!this.applyPeerJniCallState(5, reason)) {
+            return [];
+        }
+        this.currentCall.answeredAt = this.currentCall.answeredAt || Date.now();
+        this.setAndroidCallState(AndroidCallState.CONFIRMED, reason);
+        this.emitNativeCallState('connected', {
+            callId: this.currentCall.callId,
+            stage: reason
+        });
+
+        if (!this.mediaEngineEnabled) {
+            return [
+                answerAckSignal,
+                ...this.stopUnsupportedMediaCall(`${reason}-without-media-engine`)
+            ].filter(Boolean);
+        }
+
+        if (mediaTransportChanged && this.mediaEngine.active) {
+            this.currentMediaState = null;
+            this.mediaEngine.stop();
+        }
+
+        if (!this.mediaEngine.active) {
+            return [
+                answerAckSignal,
+                ...this.startMediaCall(
+                    mediaTransportChanged ? `${reason}-transport-update` : reason
+                )
+            ].filter(Boolean);
+        }
+
+        this.callWindow.update(this.currentCall, this.currentMediaState);
+        this.scheduleConnectedRemoteSilenceWatchdog(`${reason}-media-running`);
+
+        return [
+            answerAckSignal,
+            this.buildCallState('connected', {
+                callId: this.currentCall.callId,
+                reason,
+                stage: 'media-running',
+                androidState: this.currentCall.androidState
+            })
+        ].filter(Boolean);
+    }
+
+    getPeerJniHandle() {
+        return this.peerJni && this.peerJni.peerHandle || 1;
     }
 
     receivePreconnect(kind, peerId, callId, payload, details = {}) {
@@ -1146,6 +1356,106 @@ class LinuxCallEngine {
         });
 
         return [];
+    }
+
+    scheduleStatusFivePreconnectTimeout(status) {
+        const call = this.currentCall;
+        if (!call || call.incoming || !call.pendingStatusFivePreconnect) {
+            return;
+        }
+
+        this.clearStatusFivePreconnectTimer('reschedule-status-five-preconnect');
+        const timeoutEnv = process.env.ZALO_CALL_STATUS5_PRECONNECT_TIMEOUT_MS;
+        const timeoutMs = Number(timeoutEnv);
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+            this.record('statusFivePreconnectTimeoutDisabled', {
+                callId: call.callId,
+                status,
+                checkTimeoutMs: this.lastCheckTimeoutMs
+            });
+            return;
+        }
+
+        const callId = call.callId;
+        call.pendingStatusFivePreconnect.timeoutTimer = setTimeout(() => {
+            const current = this.currentCall;
+            if (
+                !current ||
+                current.incoming ||
+                current.answeredAt ||
+                String(current.callId) !== String(callId) ||
+                !current.pendingStatusFivePreconnect
+            ) {
+                return;
+            }
+
+            this.record('statusFivePreconnectTimeout', {
+                callId,
+                status,
+                timeoutMs,
+                androidState: current.androidState
+            });
+            const responses = this.handleRemoteEndControl({
+                act_type: 'voip',
+                act: 'answer_failed',
+                data: {
+                    callId,
+                    status,
+                    reason: 'status-five-preconnect-timeout'
+                }
+            });
+            for (const response of responses) {
+                if (this.send) this.send(response);
+            }
+        }, timeoutMs);
+
+        if (call.pendingStatusFivePreconnect.timeoutTimer.unref) {
+            call.pendingStatusFivePreconnect.timeoutTimer.unref();
+        }
+        this.record('statusFivePreconnectTimeoutScheduled', {
+            callId,
+            status,
+            timeoutMs
+        });
+    }
+
+    clearStatusFivePreconnectTimer(reason) {
+        const pending = this.currentCall && this.currentCall.pendingStatusFivePreconnect;
+        if (!pending || !pending.timeoutTimer) {
+            return;
+        }
+
+        clearTimeout(pending.timeoutTimer);
+        pending.timeoutTimer = null;
+        this.record('statusFivePreconnectTimeoutCleared', {
+            callId: this.currentCall.callId,
+            reason
+        });
+    }
+
+    rememberVoipResetTime(data) {
+        const payload = this.unwrapControlData(data);
+        const settings = payload && payload.settings && typeof payload.settings === 'object' ?
+            payload.settings :
+            null;
+        const resetSeconds = Number(settings && settings.voipResetTime);
+        if (Number.isFinite(resetSeconds) && resetSeconds > 0) {
+            this.lastVoipResetTimeMs = Math.max(0, Math.round(resetSeconds * 1000));
+            this.record('voipResetTimeUpdated', {
+                callId: this.currentCall && this.currentCall.callId,
+                resetSeconds,
+                resetMs: this.lastVoipResetTimeMs
+            });
+        }
+
+        const checkTimeoutMs = Number(settings && settings.checkTimeOut);
+        if (Number.isFinite(checkTimeoutMs) && checkTimeoutMs > 0) {
+            this.lastCheckTimeoutMs = Math.round(checkTimeoutMs);
+            this.record('callCheckTimeoutUpdated', {
+                callId: this.currentCall && this.currentCall.callId,
+                checkTimeoutMs: this.lastCheckTimeoutMs
+            });
+        }
     }
 
     isRemoteHangupControl(data) {
@@ -1810,6 +2120,8 @@ class LinuxCallEngine {
             ];
         }
 
+        this.prepareAndroidSessionForNewIncomingCall(incomingCall);
+
         this.currentCall = incomingCall;
         this.currentMediaState = null;
         this.callRunning = true;
@@ -2224,11 +2536,26 @@ class LinuxCallEngine {
                 reason
             });
             this.send(signal);
+            this.delayedSignalTimers.delete(timer);
         }, safeDelayMs);
 
+        this.delayedSignalTimers.add(timer);
         if (timer.unref) {
             timer.unref();
         }
+    }
+
+    clearDelayedSignals(reason) {
+        if (!this.delayedSignalTimers || this.delayedSignalTimers.size === 0) {
+            return;
+        }
+
+        const count = this.delayedSignalTimers.size;
+        for (const timer of this.delayedSignalTimers) {
+            clearTimeout(timer);
+        }
+        this.delayedSignalTimers.clear();
+        this.record('delayedSignalsCleared', { count, reason });
     }
 
     scheduleConnectedRemoteSilenceWatchdog(reason) {
@@ -2606,12 +2933,13 @@ class LinuxCallEngine {
         }
 
         this.currentCall.state = 'sendRequestCall';
+        this.applyPeerJniOutgoingMakeCallFromRequest(requestData);
 
         // 416 confirms the transport selected from the 401 response.
         const requestSignal = {
             type: 'sendSignal',
             command: SIGNAL_COMMAND.REQUEST_TRANSPORT,
-            data: requestData
+            data: this.buildRequestTransportSignalPayload(requestData)
         };
 
         this.record('sendSignal', {
@@ -2620,6 +2948,104 @@ class LinuxCallEngine {
         });
 
         return [requestSignal];
+    }
+
+    buildRequestTransportSignalPayload(requestData) {
+        const payload = Object.assign({}, requestData || {});
+        delete payload.__androidListServer;
+        delete payload.__androidResponse;
+        return payload;
+    }
+
+    applyPeerJniOutgoingMakeCallFromRequest(requestData) {
+        if (!this.currentCall || this.currentCall.nativeMakeCallApplied) {
+            return false;
+        }
+
+        const listServer = this.getFirstValue(
+            requestData && requestData.__androidListServer,
+            requestData && requestData.listServer,
+            requestData && requestData.listserver,
+            requestData && requestData.list_server,
+            requestData && requestData.servers
+        );
+        const session = this.getFirstValue(
+            requestData && requestData.session,
+            this.currentCall.session
+        );
+
+        if (!session || !listServer) {
+            this.record('androidMakeCallGateRejected', {
+                callId: this.currentCall.callId,
+                hasSession: !!session,
+                hasListServer: !!listServer,
+                requestKeys: requestData ? Object.keys(requestData) : []
+            });
+            return false;
+        }
+
+        if (!this.peerJni || typeof this.peerJni.zrtc_peer_make_call !== 'function') {
+            this.record('androidMakeCallGateRejected', {
+                callId: this.currentCall.callId,
+                reason: 'missing-peer-jni'
+            });
+            return false;
+        }
+
+        const payload = Object.assign(
+            {},
+            this.currentCall.requestData || {},
+            requestData || {},
+            {
+                __androidReadyMakeCall: true,
+                callId: this.currentCall.callId,
+                id: this.currentCall.callId,
+                session,
+                sessId: session,
+                listServer,
+                userId: this.currentCall.localUserId,
+                fromId: this.currentCall.localUserId,
+                calleeId: this.currentCall.calleeId,
+                partner: [{
+                    id: this.currentCall.calleeId,
+                    name: this.currentCall.calleeName,
+                    avatar: this.currentCall.calleeAvatar
+                }]
+            }
+        );
+
+        this.peerJni.zrtc_peer_make_call(this.getPeerJniHandle(), payload, listServer);
+        return true;
+    }
+
+    applyAndroidReadyMakeCall(payload) {
+        if (!this.currentCall) {
+            this.record('androidMakeCallIgnored', {
+                reason: 'no-current-call',
+                callId: payload && (payload.callId || payload.id) || ''
+            });
+            return [];
+        }
+
+        this.currentCall.nativeMakeCallApplied = true;
+        this.currentCall.nativeMakeCallAt = Date.now();
+        this.currentCall.session = payload && (payload.session || payload.sessId) || this.currentCall.session;
+        this.currentCall.listServer = payload && payload.listServer || this.currentCall.listServer || '';
+        this.currentCall.transportConfig = Object.assign(
+            {},
+            this.currentCall.transportConfig || {},
+            {
+                session: this.currentCall.session,
+                listServer: this.currentCall.listServer
+            }
+        );
+        this.setAndroidCallState(AndroidCallState.OUTGOING_INIT, 'android-zrtc-peer-make-call');
+        this.record('androidMakeCallApplied', {
+            callId: this.currentCall.callId,
+            hasSession: !!this.currentCall.session,
+            hasListServer: !!this.currentCall.listServer
+        });
+        return [];
     }
 
     buildRequestCallPayload(data) {
@@ -2642,6 +3068,28 @@ class LinuxCallEngine {
             response.session_id ||
             response.sessionId ||
             (nestedCandidate && nestedCandidate.session);
+        const listServer = this.getFirstValue(
+            response.listServer,
+            response.listserver,
+            response.list_server,
+            response.servers,
+            response.serverList,
+            response.server_list,
+            response.relayServer,
+            response.relay_server,
+            response.extraServer,
+            response.extra_server,
+            nestedCandidate && nestedCandidate.listServer,
+            nestedCandidate && nestedCandidate.listserver,
+            nestedCandidate && nestedCandidate.list_server,
+            nestedCandidate && nestedCandidate.servers,
+            nestedCandidate && nestedCandidate.serverList,
+            nestedCandidate && nestedCandidate.server_list,
+            nestedCandidate && nestedCandidate.relayServer,
+            nestedCandidate && nestedCandidate.relay_server,
+            nestedCandidate && nestedCandidate.extraServer,
+            nestedCandidate && nestedCandidate.extra_server
+        );
 
         if (!rtpAddress || !rtcpAddress || !session) {
             return null;
@@ -2711,7 +3159,9 @@ class LinuxCallEngine {
             zrtcMedia: mediaMode.zrtcMedia,
             srtpMode: outboundSrtpMode,
             newZrtc: outboundNewZrtc,
-            packetMode: outboundPacketMode
+            packetMode: outboundPacketMode,
+            __androidListServer: listServer || '',
+            __androidResponse: response
         };
 
         // Keep Linux-only runtime hints out of the 416 payload. The renderer
@@ -2898,7 +3348,18 @@ class LinuxCallEngine {
             params.callerName,
             params.displayName,
             params.name,
-            peerId
+            ''
+        );
+        const avatar = this.getFirstValue(
+            payload.callerAvatar,
+            payload.avatar,
+            payload.photo,
+            payload.picture,
+            params.callerAvatar,
+            params.avatar,
+            params.photo,
+            params.picture,
+            ''
         );
 
         const call = {
@@ -2923,6 +3384,7 @@ class LinuxCallEngine {
                 0
             ),
             calleeName: displayName,
+            calleeAvatar: avatar,
             callType,
             startedAt: Date.now(),
             answeredAt: null,
@@ -3416,6 +3878,34 @@ class LinuxCallEngine {
         ));
 
         return status === undefined ? null : status;
+    }
+
+    hasAnswerPreconnectTransport(data) {
+        const payload = this.unwrapControlData(data);
+        const params = this.parseParams(payload.params);
+        const codec = this.getFirstValue(payload.codec, params.codec);
+        const extendData = this.getFirstValue(
+            payload.extendData,
+            payload.extend_data,
+            params.extendData,
+            params.extend_data
+        );
+        const rtpAddress = this.getFirstValue(
+            payload.rtpIP,
+            payload.rtpAddress,
+            payload.rtpSerIp,
+            params.rtpIP,
+            params.rtpAddress,
+            params.rtpSerIp
+        );
+        const session = this.getFirstValue(
+            payload.session,
+            payload.sessId,
+            params.session,
+            params.sessId
+        );
+
+        return !!(codec && extendData && rtpAddress && session);
     }
 
     collectIds(...values) {
@@ -4154,10 +4644,29 @@ class LinuxCallEngine {
 
     shutdown() {
         this.clearPendingOutgoingCall();
-        this.mediaEngine.stop();
+        this.mediaEngine.stop({
+            forceClose: true,
+            resetPorts: true
+        });
         this.callWindow.close();
         this.resetActiveCallState();
         this.emitNativeCallState('free', { reason: 'shutdown' });
+    }
+
+    destroyNativePeerSession(reason = 'peer-delete') {
+        this.clearPendingOutgoingCall();
+        this.mediaEngine.stop({
+            forceClose: true,
+            resetPorts: true
+        });
+        this.callWindow.close();
+        this.clearAndroidVolatileCallData(reason, {
+            forcePeerIdle: false,
+            clearNativeEvents: true
+        });
+        this.lastCallEndedAt = Date.now();
+        this.emitNativeCallState('free', { reason });
+        this.record('nativePeerSessionDestroyed', { reason });
     }
 
     clearPendingOutgoingCall() {
@@ -4169,15 +4678,163 @@ class LinuxCallEngine {
         this.pendingOutgoingCallTimer = null;
     }
 
+    prepareAndroidSessionForNewOutgoingCall(data = {}) {
+        if (!this.localState || typeof this.localState !== 'object') {
+            this.localState = {};
+        }
+        const staleTransport = this.localState && this.localState.configuredTransport;
+        const staleMediaConfig = this.localState && this.localState.mediaConfig;
+        const staleCall = this.currentCall;
+        const staleMedia = this.getMediaActivitySummary();
+        const staleMediaActive = !!(
+            this.mediaEngine &&
+            (
+                this.mediaEngine.active ||
+                this.hasMediaActivityRelays(staleMedia) ||
+                staleMedia && staleMedia.processCount > 0
+            )
+        );
+        if (staleTransport || staleMediaConfig || staleCall || staleMediaActive) {
+            this.record('androidSessionPreMakeCallCleanup', {
+                staleTransportCallId: staleTransport && staleTransport.callId,
+                staleCurrentCallId: staleCall && staleCall.callId,
+                nextCallId: this.getFirstValue(data.callId, data.id, data.providedCallId),
+                hadMediaConfig: !!staleMediaConfig,
+                hadMediaActive: staleMediaActive,
+                media: staleMedia
+            });
+        }
+
+        this.mediaEngine.stop({
+            forceClose: true,
+            resetPorts: true
+        });
+        this.callWindow.close();
+
+        this.clearAndroidVolatileCallData('prepare-new-outgoing-call', {
+            forcePeerIdle: false,
+            clearNativeEvents: true,
+            resetPeerConnector: true
+        });
+    }
+
+    prepareAndroidSessionForNewIncomingCall(incomingCall = {}) {
+        if (!this.localState || typeof this.localState !== 'object') {
+            this.localState = {};
+        }
+        const staleTransport = this.localState && this.localState.configuredTransport;
+        const staleMediaConfig = this.localState && this.localState.mediaConfig;
+        const staleMedia = this.getMediaActivitySummary();
+        const staleMediaActive = !!(
+            this.mediaEngine &&
+            (
+                this.mediaEngine.active ||
+                this.hasMediaActivityRelays(staleMedia) ||
+                staleMedia && staleMedia.processCount > 0
+            )
+        );
+        if (staleTransport || staleMediaConfig || staleMediaActive) {
+            this.record('androidSessionPreIncomingCleanup', {
+                staleTransportCallId: staleTransport && staleTransport.callId,
+                incomingCallId: incomingCall && incomingCall.callId,
+                hadMediaConfig: !!staleMediaConfig,
+                hadMediaActive: staleMediaActive,
+                media: staleMedia
+            });
+        }
+
+        this.mediaEngine.stop({
+            forceClose: true,
+            resetPorts: true
+        });
+        this.clearAndroidVolatileCallData('prepare-new-incoming-call', {
+            forcePeerIdle: false,
+            clearNativeEvents: true,
+            resetPeerConnector: true
+        });
+    }
+
     resetActiveCallState() {
-        if (this.currentCall) {
+        const hadCall = !!this.currentCall;
+        const callId = this.currentCall && this.currentCall.callId;
+        if (hadCall) {
             this.lastCallEndedAt = Date.now();
         }
+
+        this.clearAndroidVolatileCallData('reset-active-call-state', {
+            forcePeerIdle: true,
+            clearNativeEvents: true,
+            resetPeerConnector: true,
+            ended: true
+        });
+
+        this.record('androidSessionResetComplete', {
+            reason: 'reset-active-call-state',
+            callId,
+            hadCall
+        });
+    }
+
+    clearAndroidVolatileCallData(reason, options = {}) {
+        if (!this.localState || typeof this.localState !== 'object') {
+            this.localState = {};
+        }
+
+        const call = this.currentCall;
+        if (call) {
+            this.clearStatusFivePreconnectTimer(reason);
+            delete call.pendingStatusFivePreconnect;
+            delete call.preconnect;
+            call.incomingAnswerAckPending = false;
+            call.answerAckSent = false;
+        }
+
+        if (options.forcePeerIdle) {
+            this.applyPeerJniCallState(0, reason);
+        }
+
+        if (
+            options.resetPeerConnector &&
+            this.peerJni &&
+            typeof this.peerJni.resetRuntimeState === 'function'
+        ) {
+            this.peerJni.resetRuntimeState(reason, {
+                ended: !!options.ended
+            });
+        }
+
         this.clearConnectedRemoteSilenceWatchdog();
+        this.clearDelayedSignals(reason);
+        this.clearPendingOutgoingCall();
+
+        this.localState.configuredTransport = null;
+        this.localState.mediaConfig = null;
+        this.localState.remoteAudioMuted = false;
+        this.localState.remoteAudioHeld = false;
+        this.localState.audioMuted = false;
+        this.localState.audioHeld = false;
+        this.localState.captureStopped = false;
+        this.localState.desktopCapture = false;
+        this.localState.partnerOffCamera = false;
+
         this.callRunning = false;
         this.currentMediaState = null;
         this.currentCall = null;
         this.lastOutgoingCallId = null;
+
+        if (options.clearNativeEvents) {
+            const count = this.nativeEventQueue.length;
+            this.nativeEventQueue = [];
+            if (count > 0) {
+                this.record('nativeEventQueueCleared', { count, reason });
+            }
+        }
+
+        this.record('androidVolatileCallDataCleared', {
+            reason,
+            forcePeerIdle: !!options.forcePeerIdle,
+            localStateKeys: Object.keys(this.localState)
+        });
     }
 
     createOutgoingCallId(data = {}) {

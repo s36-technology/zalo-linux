@@ -49,9 +49,41 @@
       place-items: center;
       background: #2b7de9;
       color: white;
-      font-size: 46px;
+      font-size: 42px;
       font-weight: 700;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .avatar .fallback {
+      display: grid;
+      place-items: center;
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    .avatar .phone {
+      position: absolute;
+      right: 14px;
+      bottom: 12px;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #20b26b;
+      font-size: 16px;
+      line-height: 1;
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.28);
     }
 
     h1 {
@@ -178,9 +210,9 @@
     function render(call) {
       currentCall = call || {};
       ending = false;
-      const displayName = currentCall.calleeName || currentCall.calleeId || 'ZaloCall';
+      const displayName = getDisplayName(currentCall);
       nameEl.textContent = displayName;
-      avatar.textContent = String(displayName).trim().charAt(0).toUpperCase() || 'Z';
+      renderAvatar(displayName, currentCall.calleeAvatar || currentCall.avatar);
 
       mediaEl.innerHTML = '';
       addPill(currentCall.isVideo ? 'Video call' : 'Audio call');
@@ -196,6 +228,46 @@
       syncRingback();
       updateDuration();
       syncDurationTimer();
+    }
+
+    function getDisplayName(call) {
+      const name = call.displayName || call.calleeName || call.callerName || call.partnerName;
+      if (name && String(name).trim()) return String(name).trim();
+      return call.incoming ? 'Incoming Zalo call' : 'Zalo call';
+    }
+
+    function renderAvatar(displayName, avatarUrl) {
+      avatar.innerHTML = '';
+
+      if (avatarUrl && /^https?:\/\//i.test(String(avatarUrl))) {
+        const img = document.createElement('img');
+        img.alt = displayName;
+        img.src = avatarUrl;
+        img.onerror = () => renderAvatarFallback(displayName);
+        avatar.appendChild(img);
+        avatar.appendChild(createPhoneIcon());
+        return;
+      }
+
+      renderAvatarFallback(displayName);
+    }
+
+    function renderAvatarFallback(displayName) {
+      avatar.innerHTML = '';
+      const fallback = document.createElement('div');
+      fallback.className = 'fallback';
+      fallback.textContent = String(displayName).trim().charAt(0).toUpperCase() || 'Z';
+
+      const phone = document.createElement('span');
+      fallback.appendChild(createPhoneIcon());
+      avatar.appendChild(fallback);
+    }
+
+    function createPhoneIcon() {
+      const phone = document.createElement('span');
+      phone.className = 'phone';
+      phone.textContent = '☎';
+      return phone;
     }
 
     function addPill(text) {

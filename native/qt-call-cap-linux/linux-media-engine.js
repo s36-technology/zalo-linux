@@ -280,10 +280,14 @@ class LinuxMediaEngine {
             const delayedClose = this.sendZrtcEndCallPackets(relay, options.zrtcEndCall);
             this.record('mediaRelayStopped', this.getRelaySummary(relay));
 
-            this.closeRelay(relay, delayedClose);
+            this.closeRelay(relay, options.forceClose ? false : delayedClose);
         }
 
         this.active = false;
+
+        if (options.resetPorts) {
+            this.recentPorts.clear();
+        }
     }
 
     getActivitySummary() {
@@ -1080,6 +1084,10 @@ class LinuxMediaEngine {
             } else {
                 const timer = setTimeout(sendPacket, spacingMs * index);
                 if (timer.unref) timer.unref();
+                if (!Array.isArray(relay.zrtcEndTimers)) {
+                    relay.zrtcEndTimers = [];
+                }
+                relay.zrtcEndTimers.push(timer);
             }
         }
 
@@ -1173,6 +1181,11 @@ class LinuxMediaEngine {
         }
 
         const close = () => {
+            if (Array.isArray(relay.zrtcEndTimers)) {
+                for (const timer of relay.zrtcEndTimers.splice(0)) {
+                    clearTimeout(timer);
+                }
+            }
             relay.closed = true;
             try {
                 relay.socket.close();
@@ -1391,7 +1404,8 @@ class LinuxMediaEngine {
         }
 
         const needsToken = this.localMediaNeedsZrtcToken(relay);
-        const token = needsToken ? this.getRelayZrtcToken(relay) : 0;
+        const relayToken = this.getRelayZrtcToken(relay);
+        const token = needsToken ? relayToken : 0;
         if (needsToken && !token) {
             if (this.shouldFallbackToPlainMedia(relay)) {
                 relay.zrtcPlainFallbackPackets += 1;
@@ -1415,6 +1429,10 @@ class LinuxMediaEngine {
         }
         relay.zrtcWrappedLocalPackets += 1;
         relay.zrtcWrappedLocalBytes += packet.length;
+        this.noteZrtcLocalWrapper(relay, packet, message, {
+            primary: true,
+            token: token || null
+        });
 
         const outgoingPackets = [];
         if (this.shouldDualSendPlainMedia(relay)) {
@@ -1425,14 +1443,14 @@ class LinuxMediaEngine {
 
         outgoingPackets.push(packet);
 
-        if (this.shouldDualSendZrtcWrappers(relay, token || 0)) {
-            const fallbackPacket = this.buildZrtcMediaPacket(relay, message, token || 0, false, {
+        if (this.shouldDualSendZrtcWrappers(relay, relayToken || 0)) {
+            const fallbackPacket = this.buildZrtcMediaPacket(relay, message, relayToken || 0, false, {
                 forceLong: true
             });
 
             if (!fallbackPacket.equals(packet)) {
                 relay.zrtcDualWrapperPackets += 1;
-                this.noteZrtcDualWrapperSend(relay, message.length);
+                this.noteZrtcDualWrapperSend(relay, fallbackPacket, message, relayToken || 0);
                 outgoingPackets.push(fallbackPacket);
             }
         }
@@ -2633,13 +2651,34 @@ class LinuxMediaEngine {
         }));
     }
 
+    noteZrtcLocalWrapper(relay, packet, rtp, extra = {}) {
+        if (
+            relay.zrtcWrappedLocalPackets !== 1 &&
+            relay.zrtcWrappedLocalPackets % 250 !== 0
+        ) {
+            return;
+        }
+
+        this.record('mediaZrtcLocalWrapper', Object.assign(this.getRelaySummary(relay), extra, {
+            wrapperType: packet && packet.length ? packet[0] : null,
+            wrapperBytes: packet ? packet.length : 0,
+            rtpBytes: rtp ? rtp.length : 0,
+            payload: this.getRtpPayloadType(rtp),
+            sequence: this.getRtpSequence(rtp),
+            ssrc: this.getRtpSsrc(rtp),
+            packetMode: relay.zrtcPacketMode || null
+        }));
+    }
+
     shouldDualSendZrtcWrappers(relay, token) {
         if (!relay || !relay.zrtcMediaEnabled || !token) {
             return false;
         }
 
-        if (process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER !== '1') {
-            return false;
+        if (process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER !== undefined) {
+            if (process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER !== '1') {
+                return false;
+            }
         }
 
         if (!relay.call || relay.call.incoming || Number(relay.zrtcPacketMode) !== 2) {
@@ -2653,11 +2692,11 @@ class LinuxMediaEngine {
             return false;
         }
 
-        const maxPackets = Math.max(0, Number(process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER_PACKETS || 300));
+        const maxPackets = Math.max(0, Number(process.env.ZALO_LINUX_CALL_ZRTC_DUAL_WRAPPER_PACKETS || 1500));
         return relay.localPackets <= maxPackets;
     }
 
-    noteZrtcDualWrapperSend(relay, bytes) {
+    noteZrtcDualWrapperSend(relay, packet, rtp, token) {
         if (
             relay.zrtcDualWrapperPackets !== 1 &&
             relay.zrtcDualWrapperPackets % 250 !== 0
@@ -2666,7 +2705,14 @@ class LinuxMediaEngine {
         }
 
         this.record('mediaZrtcDualWrapperSend', Object.assign(this.getRelaySummary(relay), {
-            bytes
+            wrapperType: packet && packet.length ? packet[0] : null,
+            wrapperBytes: packet ? packet.length : 0,
+            rtpBytes: rtp ? rtp.length : 0,
+            token: token || null,
+            payload: this.getRtpPayloadType(rtp),
+            sequence: this.getRtpSequence(rtp),
+            ssrc: this.getRtpSsrc(rtp),
+            packetMode: relay.zrtcPacketMode || null
         }));
     }
 

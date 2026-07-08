@@ -133,9 +133,9 @@ Linux rule:
 
 - JS-visible connected is native event `onCallState(4)`.
 - Internal/native state `5` follows actual connected progress. A remote web
-  `status=5` answer should be handled as answer-preconnect input, then promoted
-  to `onCallState(4)` after local media and ACK make the native preconnect
-  equivalent succeed.
+  `status=5` answer is only answer-preconnect input in Linux; do not promote it
+  to `onCallState(4)`, do not start the counter, and do not send `408` unless a
+  later confirmed answer or native/media-connected event succeeds.
 - `onInitZrtpWithServer` must use native payload names: `rtcp` and `rtp`.
 - `onInitZrtpRequestFailed` must use native payload name `retCode`.
 - `418` should update the current RTP/RTCP/session, emit
